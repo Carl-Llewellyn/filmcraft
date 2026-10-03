@@ -59,18 +59,32 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let rate = seq.settings.frame_rate;
     let frame_dur = rate.frame_duration().0.max(1);
     let frames = (it.duration.0.max(1) + frame_dur - 1) / frame_dur;
-    let target_ticks = (lane.width() / 58.0).max(1.0) as i64;
+    let ruler_font = Tokens::mono(9.0);
+    let label_width = ui.painter().layout_no_wrap("00:00:00:00".into(), ruler_font.clone(), t.tl_ruler_text).size().x;
+    let min_label_spacing = label_width + 6.0;
+    let target_ticks = (lane.width() / min_label_spacing).max(1.0) as i64;
     let raw_step = (frames / target_ticks).max(1);
     let magnitude = 10_i64.pow((raw_step as f64).log10().floor().max(0.0) as u32);
     let step_frames = [1, 2, 5, 10].into_iter().map(|n| n * magnitude).find(|n| *n >= raw_step).unwrap_or(10 * magnitude);
+    let label_spacing = step_frames as f32 / frames.max(1) as f32 * lane.width();
+    let show_labels = label_spacing >= min_label_spacing;
     let tick_y = lane.min.y + 16.0;
     let painter = ui.painter().with_clip_rect(lane);
     painter.line_segment([pos2(lane.min.x, tick_y), pos2(lane.max.x, tick_y)], Stroke::new(1.0, t.separator));
-    for f in (0..=frames).step_by(step_frames as usize) {
+    let minor_step = (step_frames / 5).max(1);
+    for f in (0..=frames).step_by(minor_step as usize) {
         let x = lane.min.x + (f as f32 / frames.max(1) as f32) * lane.width();
-        painter.line_segment([pos2(x, tick_y - 5.0), pos2(x, tick_y + 2.0)], Stroke::new(1.0, t.tl_ruler_tick));
-        let tc = filmcraft_time::format_time(it.start + Tick(f * frame_dur), rate, seq.settings.drop_frame, filmcraft_time::TimeDisplay::Timecode, 48000);
-        painter.text(pos2(x + 2.0, lane.min.y + 1.0), Align2::LEFT_TOP, tc, Tokens::mono(9.0), t.tl_ruler_text);
+        let major = f % step_frames == 0;
+        let height = if major { 6.0 } else { 3.0 };
+        painter.line_segment([pos2(x, tick_y - height), pos2(x, tick_y + 2.0)], Stroke::new(1.0, t.tl_ruler_tick));
+        // Tick marks are independent of labels: hide a label if this ruler is too narrow, but
+        // retain every major and subdivision tick so temporal spacing remains visible.
+        if major && show_labels {
+            let tc = filmcraft_time::format_time(it.start + Tick(f * frame_dur), rate, seq.settings.drop_frame, filmcraft_time::TimeDisplay::Timecode, 48000);
+            if x + label_width + 3.0 <= lane.max.x {
+                painter.text(pos2(x + 2.0, lane.min.y + 1.0), Align2::LEFT_TOP, tc, ruler_font.clone(), t.tl_ruler_text);
+            }
+        }
     }
     let clip_bar = Rect::from_min_max(pos2(lane.min.x, lane.min.y + 19.0), pos2(lane.max.x, lane.min.y + 33.0));
     ui.painter().rect_filled(clip_bar, 2.0, Color32::from_rgb(58, 58, 70));
@@ -105,11 +119,11 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let open = !app.ui.collapsed_fx.contains(&key);
             let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click());
             bui.painter().rect_filled(r, 0.0, t.panel_bg);
-            bui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.separator));
-            bui.painter().line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, t.separator));
             if resp.hovered() {
                 bui.painter().rect_filled(r, 0.0, t.hover);
             }
+            bui.painter().line_segment([r.left_top(), pos2(lane.max.x, r.min.y)], Stroke::new(1.0, t.separator));
+            bui.painter().line_segment([r.left_bottom(), pos2(lane.max.x, r.max.y)], Stroke::new(1.0, t.separator));
             icons::paint(
                 bui.painter(),
                 Rect::from_center_size(pos2(r.min.x + 10.0, r.center().y), vec2(10.0, 10.0)),
@@ -250,6 +264,9 @@ pub(crate) fn param_row(
         v
     };
     let (r, _) = ui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::hover());
+    // Extend each parameter's row guide through the keyframe lane, like the edit rows in a
+    // conventional effect-controls timeline, so a diamond is visually tied to its parameter.
+    ui.painter().line_segment([r.left_bottom(), pos2(lane.max.x, r.max.y)], Stroke::new(1.0, t.separator));
     let mut x = r.min.x + 26.0;
     // twirl-down for the value/velocity graphs (animated scalar params)
     if param.is_animated() && matches!(param.value, ParamValue::Float(_)) {
