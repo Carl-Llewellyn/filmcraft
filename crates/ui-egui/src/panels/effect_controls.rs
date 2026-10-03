@@ -13,6 +13,12 @@ use crate::theme::Tokens;
 
 const ROW_H: f32 = 22.0;
 
+fn trace_keyframes(message: impl std::fmt::Display) {
+    if std::env::var_os("FILMCRAFT_KEYFRAME_TRACE").is_some() {
+        eprintln!("[keyframe-trace] {message}");
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct KeyframeClipboardEntry {
     effect: String,
@@ -38,7 +44,11 @@ fn selected_clip(app: &FilmcraftApp) -> Option<(ClipId, TrackItem, filmcraft_pro
 }
 
 pub(crate) fn copy_selected_keyframes(app: &mut FilmcraftApp) -> bool {
-    let Some((clip, item, _)) = selected_clip(app) else { return false };
+    let Some((clip, item, _)) = selected_clip(app) else {
+        trace_keyframes("copy aborted: no selected clip");
+        return false;
+    };
+    trace_keyframes(format!("copy begin: clip={} selected={:?}", clip.0, app.ui.effect_keyframes));
     let mut selected = Vec::new();
     for selection in app.ui.effect_keyframes.iter().filter(|selection| selection.clip == clip.0) {
         let Some(effect) = item.effects.iter().find(|effect| effect.effect == selection.effect) else { continue };
@@ -51,6 +61,7 @@ pub(crate) fn copy_selected_keyframes(app: &mut FilmcraftApp) -> bool {
         selected.push((selection.effect.clone(), selection.param.clone(), selection.mask, timeline_time, keyframe));
     }
     let Some(anchor) = selected.iter().map(|entry| entry.3).min() else {
+        trace_keyframes("copy found no valid selected keyframes");
         app.ui.status = "Select keyframes in Effect Controls to copy".into();
         return true;
     };
@@ -58,6 +69,7 @@ pub(crate) fn copy_selected_keyframes(app: &mut FilmcraftApp) -> bool {
         .into_iter()
         .map(|(effect, param, mask, time, keyframe)| KeyframeClipboardEntry { effect, param, mask, offset: (time - anchor).0, keyframe })
         .collect();
+    trace_keyframes(format!("copy complete: {} keyframes", app.keyframe_clipboard.len()));
     app.ui.status = format!("Copied {} keyframe{}", app.keyframe_clipboard.len(), if app.keyframe_clipboard.len() == 1 { "" } else { "s" });
     true
 }
@@ -67,23 +79,35 @@ pub(crate) fn paste_keyframes(app: &mut FilmcraftApp) -> bool {
         return false;
     }
     let Some((clip, item, _)) = selected_clip(app) else {
+        trace_keyframes("paste aborted: no destination clip");
         app.ui.status = "Select a destination clip to paste keyframes".into();
         return true;
     };
     let anchor = app.session.playhead().clamp(item.start, item.end() - Tick(1));
+    trace_keyframes(format!("paste begin: destination_clip={} anchor={} clipboard={}", clip.0, anchor.0, app.keyframe_clipboard.len()));
     let mut tracks: Vec<Value> = Vec::new();
+    let mut out_of_range = 0;
+    let mut unmatched = 0;
     for entry in &app.keyframe_clipboard {
         let timeline_time = anchor + Tick(entry.offset);
         if timeline_time < item.start || timeline_time >= item.end() {
+            out_of_range += 1;
             continue;
         }
-        let Some(effect) = item.effects.iter().find(|effect| effect.effect == entry.effect) else { continue };
+        let Some(effect) = item.effects.iter().find(|effect| effect.effect == entry.effect) else {
+            unmatched += 1;
+            continue;
+        };
         let param = match entry.mask {
             Some(mask) => effect.masks.get(mask).and_then(|mask| mask.param(&entry.param)),
             None => effect.params.get(&entry.param),
         };
-        let Some(param) = param else { continue };
+        let Some(param) = param else {
+            unmatched += 1;
+            continue;
+        };
         if std::mem::discriminant(&entry.keyframe.value) != std::mem::discriminant(&param.value) {
+            unmatched += 1;
             continue;
         }
         let media_time = item.source_time_at(timeline_time);
@@ -109,15 +133,21 @@ pub(crate) fn paste_keyframes(app: &mut FilmcraftApp) -> bool {
         }
     }
     if tracks.is_empty() {
+        trace_keyframes(format!("paste matched nothing: out_of_range={out_of_range} unmatched={unmatched}"));
         app.ui.status = "No matching keyframe parameters on the destination clip".into();
         return true;
     }
+    let count: usize = tracks.iter().filter_map(|track| track["keyframes"].as_array().map(Vec::len)).sum();
+    trace_keyframes(format!("paste command: keyframes={count} tracks={tracks:?} out_of_range={out_of_range} unmatched={unmatched}"));
     match app.session.execute("effects.pasteKeyframes", json!({"clip": clip.0, "tracks": tracks})) {
         Ok(_) => {
-            let count: usize = tracks.iter().filter_map(|track| track["keyframes"].as_array().map(Vec::len)).sum();
+            trace_keyframes("paste command succeeded");
             app.ui.status = format!("Pasted {count} keyframe{}", if count == 1 { "" } else { "s" });
         }
-        Err(error) => app.ui.status = error.to_string(),
+        Err(error) => {
+            trace_keyframes(format!("paste command failed: {error}"));
+            app.ui.status = error.to_string();
+        }
     }
     true
 }

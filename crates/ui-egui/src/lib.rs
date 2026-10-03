@@ -131,6 +131,11 @@ pub struct FilmcraftApp {
     pub ui: UiState,
     /// Transient clipboard for Effect Controls keyframes, independent of the timeline clip clipboard.
     pub(crate) keyframe_clipboard: Vec<panels::effect_controls::KeyframeClipboardEntry>,
+    /// Some Linux window-system paths deliver Ctrl shortcuts on key release; keep modifier state
+    /// across frames so those releases are still recognized when the modifier event arrives first.
+    keyframe_ctrl_held: bool,
+    keyframe_ctrl_c_handled: bool,
+    keyframe_ctrl_v_handled: bool,
     pub tokens: Tokens,
     pub frames: Arc<FrameServer>,
     pub playback: Playback,
@@ -231,6 +236,9 @@ impl FilmcraftApp {
             session,
             ui: UiState::default(),
             keyframe_clipboard: Vec::new(),
+            keyframe_ctrl_held: false,
+            keyframe_ctrl_c_handled: false,
+            keyframe_ctrl_v_handled: false,
             tokens: Tokens::for_kind(ThemeKind::Dark),
             frames,
             playback: Playback { speed: 1.0, ..Default::default() },
@@ -710,6 +718,47 @@ impl FilmcraftApp {
     // ---------------------------------------------------------------- input
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let trace_enabled = std::env::var_os("FILMCRAFT_KEYFRAME_TRACE").is_some();
+        let key_events: Vec<_> = ctx.input(|i| i.raw.events.iter().filter(|event| matches!(event, egui::Event::Key { .. })).cloned().collect());
+        if trace_enabled && !key_events.is_empty() {
+            eprintln!("[keyframe-trace] raw keyboard events: {key_events:?}");
+        }
+        let (mut copy_release, mut paste_release) = (false, false);
+        let mut control_released = false;
+        for event in &key_events {
+            let egui::Event::Key { key, pressed, modifiers, .. } = event else { continue };
+            match key {
+                egui::Key::C if !pressed && (modifiers.ctrl || modifiers.command || self.keyframe_ctrl_held) && !self.keyframe_ctrl_c_handled => {
+                    copy_release = true;
+                    self.keyframe_ctrl_c_handled = true;
+                }
+                egui::Key::V if !pressed && (modifiers.ctrl || modifiers.command || self.keyframe_ctrl_held) && !self.keyframe_ctrl_v_handled => {
+                    paste_release = true;
+                    self.keyframe_ctrl_v_handled = true;
+                }
+                egui::Key::ControlLeft | egui::Key::ControlRight if *pressed => {
+                    self.keyframe_ctrl_held = true;
+                    self.keyframe_ctrl_c_handled = false;
+                    self.keyframe_ctrl_v_handled = false;
+                }
+                egui::Key::ControlLeft | egui::Key::ControlRight => control_released = true,
+                _ => {}
+            }
+        }
+        // Delay clearing the modifier latch until after this frame's key events: some XWayland
+        // traces report the Control release before the associated C/V release.
+        if control_released {
+            self.keyframe_ctrl_held = false;
+        }
+        if trace_enabled && (copy_release || paste_release) {
+            eprintln!(
+                "[keyframe-trace] key release copy={copy_release} paste={paste_release} focus={:?} wants_keyboard={} selected={} clipboard={}",
+                self.ui.focused,
+                ctx.egui_wants_keyboard_input(),
+                self.ui.effect_keyframes.len(),
+                self.keyframe_clipboard.len()
+            );
+        }
         if self.bindings_rev != self.session.shortcuts.revision {
             self.bindings = menus::bindings(self);
             self.bindings_rev = self.session.shortcuts.revision;
@@ -722,11 +771,17 @@ impl FilmcraftApp {
             return;
         }
         if self.ui.focused == PanelKind::EffectControls {
-            let copy = !self.ui.effect_keyframes.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+            let copy = !self.ui.effect_keyframes.is_empty() && copy_release;
+            if copy && trace_enabled {
+                eprintln!("[keyframe-trace] handling keyframe copy");
+            }
             if copy && panels::effect_controls::copy_selected_keyframes(self) {
                 return;
             }
-            let paste = !self.keyframe_clipboard.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::V));
+            let paste = !self.keyframe_clipboard.is_empty() && paste_release;
+            if paste && trace_enabled {
+                eprintln!("[keyframe-trace] handling keyframe paste");
+            }
             if paste && panels::effect_controls::paste_keyframes(self) {
                 return;
             }
@@ -1010,6 +1065,9 @@ impl FilmcraftApp {
 
     /// Contextual hint for the status bar (Premiere shows tool/gesture hints here).
     fn hint_text(&self) -> String {
+        if std::env::var_os("FILMCRAFT_KEYFRAME_TRACE").is_some() {
+            return "KEYFRAME TRACE ACTIVE — use this FilmCraft window; C/V key events are logged.".into();
+        }
         match self.ui.tool {
             state::Tool::Selection => "Click to select, or click in empty space and drag to marquee select. Use Shift, Opt, and Cmd for other options.",
             state::Tool::TrackSelectForward => "Click to select all clips to the right in all tracks. Shift-click for a single track.",
