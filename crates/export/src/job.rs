@@ -300,6 +300,7 @@ impl Exporter {
         }
         let tail = self.venc.flush()?;
         self.write_video(tail)?;
+        self.venc.finish()?;
         self.write_audio(mixed)?;
         if let (Some(at), Some(a)) = (self.at, self.aenc.as_mut()) {
             let fs = a.frame_size();

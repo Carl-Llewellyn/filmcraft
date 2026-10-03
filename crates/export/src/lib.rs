@@ -497,6 +497,11 @@ pub trait VideoEncoder: Send {
     fn timescale(&self) -> u32;
     fn encode(&mut self, frame: &EncoderFrame) -> Result<Vec<EncodedPacket>>;
     fn flush(&mut self) -> Result<Vec<EncodedPacket>>;
+    /// Release backend resources after the final packets have been drained. Asynchronous
+    /// encoders override this so job completion does not race backend teardown.
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Human-readable backend label for export progress and diagnostics.
     fn name(&self) -> &'static str {
         "Video encoder"

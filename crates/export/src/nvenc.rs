@@ -73,7 +73,7 @@ pub(super) fn factory(format: Format, w: u32, h: u32, rate: FrameRate, settings:
         Err(_) => return None,
     };
     Some(Ok(Box::new(NvencEncoder {
-        encoder,
+        encoder: Some(encoder),
         rx,
         w,
         h,
@@ -102,7 +102,7 @@ pub(super) fn available() -> bool {
 }
 
 struct NvencEncoder<H: shiguredo_nvcodec::EncodeHandler<UserData = u64, Error = shiguredo_nvcodec::Error>> {
-    encoder: Encoder<H>,
+    encoder: Option<Encoder<H>>,
     rx: Receiver<CallbackResult>,
     w: u32,
     h: u32,
@@ -177,6 +177,8 @@ impl<H: shiguredo_nvcodec::EncodeHandler<UserData = u64, Error = shiguredo_nvcod
         }
         self.pack_nv12();
         self.encoder
+            .as_ref()
+            .ok_or_else(|| ExportError::Encode("NVENC encoder already finished".into()))?
             .encode(&self.nv12, &EncodeOptions { force_intra: !self.started, force_idr: !self.started, output_spspps: !self.started }, frame.index)
             .map_err(|e| ExportError::Encode(e.to_string()))?;
         self.started = true;
@@ -186,7 +188,7 @@ impl<H: shiguredo_nvcodec::EncodeHandler<UserData = u64, Error = shiguredo_nvcod
     }
 
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        self.encoder.flush().map_err(|e| ExportError::Encode(e.to_string()))?;
+        self.encoder.as_ref().ok_or_else(|| ExportError::Encode("NVENC encoder already finished".into()))?.flush().map_err(|e| ExportError::Encode(e.to_string()))?;
         let mut packets = Vec::new();
         loop {
             match self.rx.try_recv() {
@@ -200,6 +202,11 @@ impl<H: shiguredo_nvcodec::EncodeHandler<UserData = u64, Error = shiguredo_nvcod
 
     fn name(&self) -> &'static str {
         "NVIDIA NVENC"
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        drop(self.encoder.take());
+        Ok(())
     }
 }
 
