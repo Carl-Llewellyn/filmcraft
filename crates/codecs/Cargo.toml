@@ -1,6 +1,6 @@
 [package]
 name = "filmcraft-codecs"
-description = "Container + codec hub: MP4/MOV sources, GOP-aware seeking, decoder registry, audio decoding"
+description = "Container + codec hub: MP4/MOV, Matroska, MXF and Ogg sources, image sequences, GOP-aware seeking, decoder registry, audio decoding"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +16,8 @@ filmcraft-frame = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 filmcraft-matroska = { workspace = true }
+filmcraft-mxf = { workspace = true }
+filmcraft-ogg = { workspace = true }
 filmcraft-bitstream = { workspace = true }
 filmcraft-h264 = { workspace = true }
 filmcraft-hevc = { workspace = true }
@@ -27,6 +29,11 @@ filmcraft-aac = { workspace = true }
 filmcraft-opus = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+# Decode timing counters (`gop_stats`); std's Instant panics on wasm32.
+web-time = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 # Bootstrap audio decoding (MPL-2.0, used unmodified); replaced by own decoders over time.
 symphonia = { version = "0.5.5", default-features = false, features = ["aac", "mp3", "flac", "alac", "pcm", "wav", "ogg", "vorbis", "isomp4"] }
+
+[dev-dependencies]
+filmcraft-testkit = { workspace = true }

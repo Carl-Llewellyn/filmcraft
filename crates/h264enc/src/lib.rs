@@ -161,6 +161,9 @@ pub struct EncoderConfig {
     pub mastering_display: Option<[u8; 24]>,
     /// … and (MaxCLL, MaxFALL) content light level (payloadType 144).
     pub content_light: Option<(u16, u16)>,
+    /// Requested level_idc (41 = level 4.1); None = the lowest level that fits. A level too low
+    /// for the stream is raised to the one it needs.
+    pub level: Option<u8>,
 }
 
 impl EncoderConfig {
@@ -186,6 +189,7 @@ impl EncoderConfig {
             mastering_display: None,
             content_light: None,
             aud: true,
+            level: None,
         }
     }
 }
@@ -385,7 +389,8 @@ impl Encoder {
         if matches!(cfg.rate, RateControl::Cbr { kbps: 0 } | RateControl::Vbr { target_kbps: 0, .. }) {
             return Err(Error::InvalidConfig("bitrate must be non-zero".into()));
         }
-        let level = nal::pick_level(mbw as u32, mbh as u32, fps, max_refs as u32, kbps_for_level, high);
+        let auto = nal::pick_level(mbw as u32, mbh as u32, fps, max_refs as u32, kbps_for_level, high);
+        let level = cfg.level.map_or(auto, |l| nal::level_at_least(l, auto));
         let (profile_idc, constraint) = match cfg.profile {
             Profile::Baseline => (66u8, 0xC0u8), // constraint_set0 + set1 => Constrained Baseline
             Profile::Main => (77, 0x40),

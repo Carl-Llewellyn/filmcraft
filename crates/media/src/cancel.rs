@@ -5,13 +5,36 @@
 //! [`MediaError::Cancelled`](crate::MediaError::Cancelled) once the job is no longer wanted, e.g.
 //! playback has moved past its frame. The flag travels through a thread-local, so the
 //! [`MediaSource`](crate::MediaSource) API is unchanged.
+//!
+//! The same way, [`with_catch_up`] tells sources which frames before the requested one are late
+//! (playback has passed them): a decoder that has to decode forward to the frame may skip
+//! pictures that only produce late frames and that nothing else references.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use filmcraft_time::Tick;
+
 thread_local! {
     static CURRENT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    static CATCH_UP: Cell<Option<Tick>> = const { Cell::new(None) };
+}
+
+/// Run `f` with the catch-up hint `margin` (restoring the previous one after): frames shown more
+/// than `margin` before the requested time are late (`Some(Tick::ZERO)`: everything before it).
+/// The margin is measured in media time at normal speed; a wrong guess (a sped-up or reversed
+/// clip) only costs a later re-seek, never a wrong frame.
+pub fn with_catch_up<R>(margin: Option<Tick>, f: impl FnOnce() -> R) -> R {
+    let prev = CATCH_UP.with(|c| c.replace(margin));
+    let r = f();
+    CATCH_UP.with(|c| c.set(prev));
+    r
+}
+
+/// The catch-up margin of the work running on this thread (None: no frame is late).
+pub fn catch_up() -> Option<Tick> {
+    CATCH_UP.with(Cell::get)
 }
 
 /// Run `f` with `flag` as this thread's cancellation flag (restoring the previous one after).
@@ -41,5 +64,16 @@ mod tests {
             assert!(cancelled());
         });
         assert!(!cancelled());
+    }
+
+    #[test]
+    fn catch_up_is_scoped_to_the_closure() {
+        assert_eq!(catch_up(), None);
+        with_catch_up(Some(Tick(5)), || {
+            assert_eq!(catch_up(), Some(Tick(5)));
+            with_catch_up(None, || assert_eq!(catch_up(), None));
+            assert_eq!(catch_up(), Some(Tick(5)));
+        });
+        assert_eq!(catch_up(), None);
     }
 }

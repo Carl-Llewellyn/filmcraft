@@ -374,20 +374,12 @@ pub struct UiState {
     pub show_scopes: bool,
     /// Transient status line shown in the footer.
     pub status: String,
-    /// Export mode: chosen format id and output path.
     /// Essential Sound sub-tab: "Edit" or "Browse".
     #[serde(default)]
     pub essential_sound_tab: String,
+    /// Export mode: settings, preset, destination, range, the Preset Manager and Quick Export.
     #[serde(default)]
-    pub export_format: String,
-    #[serde(default)]
-    pub export_path: String,
-    /// Export mode: burn visible caption tracks into the video.
-    #[serde(default)]
-    pub export_burn_captions: bool,
-    /// Export mode: selected H.264 backend (`hardware` or `software`; empty = detect default).
-    #[serde(default)]
-    pub export_video_encoder: String,
+    pub export: crate::panels::export_mode::ExportUi,
     /// Text panel: active tab ("Transcript" / "Captions" / "Graphics").
     #[serde(default = "captions_tab")]
     pub text_tab: String,
@@ -463,6 +455,10 @@ pub struct UiState {
     /// `panels::menu_dialogs`.
     #[serde(default)]
     pub extras: crate::panels::menu_dialogs::Extras,
+    /// Lumetri Scopes, Timecode, Events, Progress and Reference Monitor settings. See
+    /// `panels::panel_state`.
+    #[serde(default)]
+    pub panels: crate::panels::panel_state::PanelsState,
 }
 
 /// An open Edit / Clip / File menu dialog: the engine command it runs on OK and the parameters
@@ -717,10 +713,7 @@ impl Default for UiState {
             show_scopes: false,
             status: String::new(),
             essential_sound_tab: "Edit".into(),
-            export_format: "h264".into(),
-            export_path: String::new(),
-            export_burn_captions: false,
-            export_video_encoder: String::new(),
+            export: Default::default(),
             text_tab: captions_tab(),
             caption_search: String::new(),
             transcript_sel: None,
@@ -745,6 +738,7 @@ impl Default for UiState {
             guide_dialog: None,
             clip_dialog: None,
             extras: Default::default(),
+            panels: Default::default(),
         }
     }
 }

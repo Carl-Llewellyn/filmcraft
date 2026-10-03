@@ -92,9 +92,13 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if btn(ui, Icon::Bell, "notifications", "Progress", app).clicked() {
         app.ui.mode = Mode::Export;
     }
+    // Quick Export: a popup with File Name & Location, a preset list and Export (Premiere 26)
+    let qx = rect.max.x - 14.0 - 4.0 * 38.0; // the fifth button from the right
     if btn(ui, Icon::Export, "quickExport", "Quick Export", app).clicked() {
-        app.ui.mode = Mode::Export;
+        app.ui.export.quick_open = !app.ui.export.quick_open;
+        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("quick-export-toggled"), true));
     }
+    crate::panels::export_mode::quick_export(app, ui.ctx(), pos2(qx - 340.0, rect.max.y + 4.0));
     let ws_resp = btn(ui, Icon::Workspaces, "workspaces", "Workspaces", app);
     // workspace name (caps)
     let ws = app.ui.workspace.to_uppercase();

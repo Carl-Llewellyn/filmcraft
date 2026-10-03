@@ -30,6 +30,8 @@ const LAYERS: &[(&str, u8)] = &[
     ("bitstream", 0),
     ("isobmff", 0),
     ("matroska", 0),
+    ("mxf", 0),
+    ("ogg", 0),
     ("riff", 0),
     ("h264", 0),
     ("h264enc", 0),
@@ -374,6 +376,8 @@ const FIXTURE_GENERATORS: &[(&str, &str)] = &[
     ("matroska", "oracle"),
     ("prores", "oracle_decode"),
     ("dnx", "oracle_decode"),
+    ("codecs", "mxf_oracle"),
+    ("codecs", "ogg_oracle"),
 ];
 
 fn fixtures(only: &[String]) -> Result<(), String> {
@@ -446,6 +450,14 @@ fn bench_playback() -> Result<(), String> {
     run(Command::new(env!("CARGO")).args(["run", "--release", "-p", "filmcraft-ui-egui", "--example", "bench_playback", "--"]).args(&extra))
 }
 
+/// The benchmark suite (`crates/ui-egui/examples/bench/`): decode, playback, scrubbing, timeline
+/// UI, export, project save/open and peak memory, written to `target/bench/bench-<label>.{json,md}`
+/// (`cargo xtask bench --sections decode,scrub --repeat 3 --label after`). See docs/performance.md.
+fn bench() -> Result<(), String> {
+    let extra: Vec<String> = std::env::args().skip(2).collect();
+    run(Command::new(env!("CARGO")).args(["run", "--release", "-p", "filmcraft-ui-egui", "--example", "bench", "--"]).args(&extra))
+}
+
 /// The workspace root (the parent of `xtask/`).
 fn root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("xtask lives in the workspace").to_path_buf()
@@ -459,6 +471,7 @@ fn main() -> ExitCode {
         "assets" => assets(),
         "fixtures" => fixtures(&std::env::args().skip(2).collect::<Vec<_>>()),
         "ci" => ci(),
+        "bench" => bench(),
         "bench-playback" => bench_playback(),
         "web" => web(&std::env::args().skip(2).collect::<Vec<_>>()),
         "version" => {
@@ -469,10 +482,10 @@ fn main() -> ExitCode {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             ico::run(&rest.iter().map(String::as_str).collect::<Vec<_>>())
         }
-        _ => {
-            Err("usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|ico OUT IN…|version [set X.Y.Z]|ci|bench-playback [args]>"
-                .into())
-        }
+        _ => Err(
+            "usage: cargo xtask <layers|assets|wasm|web [--dev] [--serve PORT]|fixtures [crate…]|ico OUT IN…|version [set X.Y.Z]|ci|bench [args]|bench-playback [args]>"
+                .into(),
+        ),
     };
     match r {
         Ok(()) => ExitCode::SUCCESS,

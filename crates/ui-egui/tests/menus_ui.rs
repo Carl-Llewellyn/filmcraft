@@ -122,6 +122,34 @@ fn menu_items_toggles_and_help() {
 }
 
 #[test]
+fn import_image_sequence_from_the_file_menu_and_media_browser() {
+    let dir = std::env::temp_dir().join(format!("fc-ui-imgseq-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths: Vec<String> = (1..=5)
+        .map(|n| {
+            let p = dir.join(format!("plate_{n:03}.png"));
+            image::RgbaImage::from_pixel(16, 9, image::Rgba([n as u8 * 40, 0, 0, 255])).save(&p).unwrap();
+            p.to_string_lossy().to_string()
+        })
+        .collect();
+    let mut d = Driver::new();
+    let menus = d.ok("ui.menu.list", json!({}));
+    let item = menus.as_array().unwrap().iter().find(|m| m["id"] == "file.importImageSequence").cloned().expect("File ▸ Import Image Sequence…");
+    assert_eq!(item["path"], json!(["File"]));
+    // File ▸ Import Image Sequence… with the first frame chosen
+    let r = d.ok("ui.menu.invoke", json!({"id": "file.importImageSequence", "params": {"path": paths[0]}}));
+    assert_eq!(r["imageSequences"][0]["frames"], 5);
+    let id = ItemId(r["items"][0].as_u64().unwrap());
+    let kind = d.app().session.project.item(id).unwrap().as_media().unwrap().info.kind;
+    assert_eq!(kind, filmcraft_media::MediaKind::ImageSequence);
+    // Media Browser ▸ Import as Image Sequence (the selection, from frame 3)
+    d.app().ui.extras.media_browser_selection = vec![paths[2].clone()];
+    let r = d.ok("ui.menu.invoke", json!({"id": "file.importFromMediaBrowser", "params": {"imageSequence": true}}));
+    assert_eq!(r["imageSequences"][0]["frames"], 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn find_dialog_and_search_bins() {
     let mut d = Driver::new();
     d.ok("ui.set", json!({"focused": "Project"}));

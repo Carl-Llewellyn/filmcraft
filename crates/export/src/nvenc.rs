@@ -226,6 +226,7 @@ mod tests {
             sdr: true,
             signal: ColorSignal::default(),
             sink: None,
+            ..Default::default()
         };
         let Some(Ok(mut encoder)) = factory(Format::H264, 64, 64, FrameRate { num: 30, den: 1 }, &settings) else {
             // CI and developer machines without the NVIDIA driver should still run this suite.
@@ -272,6 +273,7 @@ mod tests {
             signal: ColorSignal::default(),
             sink: None,
             video_encoder: VideoEncoderPreference::Auto,
+            ..Default::default()
         };
         // Build the exact same small set of non-static images once, outside the timed region.
         // This excludes project rendering and source generation while still exercising the real

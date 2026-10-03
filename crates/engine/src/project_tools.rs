@@ -92,11 +92,29 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
         spec("file.saveAsTemplate", "Save as Template…", &["File"], None, r#"{"name":str?,"path":str?}"#, always, save_as_template),
         query("file.templates", "List Project Templates", &[], None, "{}", always, list_templates),
         spec("file.newProjectFromTemplate", "New Project from Template", &[], None, r#"{"template":name|path,"name":str?}"#, always, new_from_template),
-        spec("file.importFromMediaBrowser", "Import from Media Browser", &["File"], Some("Cmd+Alt+I"), r#"{"paths":[str]}"#, always, |s, p| {
-            if p.get("paths").and_then(Value::as_array).is_none_or(|a| a.is_empty()) {
-                return Err(bad("file.importFromMediaBrowser", "select files in the Media Browser"));
+        spec(
+            "file.importFromMediaBrowser",
+            "Import from Media Browser",
+            &["File"],
+            Some("Cmd+Alt+I"),
+            r#"{"paths":[str],"imageSequence":bool?}"#,
+            always,
+            |s, p| {
+                if p.get("paths").and_then(Value::as_array).is_none_or(|a| a.is_empty()) {
+                    return Err(bad("file.importFromMediaBrowser", "select files in the Media Browser"));
+                }
+                let seq = p.get("imageSequence").and_then(Value::as_bool).unwrap_or(false);
+                s.execute("file.import", json!({"paths": p["paths"], "imageSequence": seq}))
+            },
+        ),
+        // File ▸ Import with "Image Sequence" checked (the UI asks for the first frame).
+        spec("file.importImageSequence", "Import Image Sequence…", &["File"], None, r#"{"path":str,"bin":binId?}"#, always, |s, p| {
+            let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad("file.importImageSequence", "need `path` (the first numbered still)"))?;
+            let mut q = json!({"paths": [path], "imageSequence": true});
+            if let Some(b) = p.get("bin") {
+                q["bin"] = b.clone();
             }
-            s.execute("file.import", json!({"paths": p["paths"]}))
+            s.execute("file.import", q)
         }),
         spec(
             "file.exportSelectionProject",
@@ -229,7 +247,7 @@ pub(crate) fn apply_layout(v: &mut Vec<CommandSpec>) {
         (At::After("captions.showAll"), vec!["captions.showActiveOnly"]),
         (At::After("markers.addChapter"), vec!["markers.addFlashCue"]),
         (At::Before("file.close"), vec!["file.open"]),
-        (At::After("media.makeOffline"), vec!["file.importFromMediaBrowser", "file.import"]),
+        (At::After("media.makeOffline"), vec!["file.importFromMediaBrowser", "file.import", "file.importImageSequence"]),
     ];
     for (at, ids) in layout {
         let mut run = Vec::new();

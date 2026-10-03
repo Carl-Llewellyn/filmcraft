@@ -672,7 +672,7 @@ pub fn poll(s: &mut Session) {
             match r {
                 Ok(()) => s.mask_jobs[i].applied += n_new,
                 Err(e) => {
-                    s.events.push(crate::Event::Toast { message: e.to_string(), error: true });
+                    s.error_toast("masks.track", e.to_string());
                     if let Some(j) = s.jobs.iter().find(|j| j.id == s.mask_jobs[i].job) {
                         j.progress.cancel.store(true, Ordering::Relaxed);
                     }

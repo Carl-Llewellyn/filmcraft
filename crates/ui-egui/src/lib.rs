@@ -14,6 +14,7 @@ pub mod icons;
 pub mod links;
 pub mod menus;
 pub mod panels;
+pub mod perf;
 pub mod state;
 pub mod theme;
 pub mod widgets;
@@ -363,7 +364,9 @@ impl FilmcraftApp {
                 | PanelKind::Metadata
                 | PanelKind::LumetriScopes
                 | PanelKind::AudioTrackMixer
-                | PanelKind::Text => PanelKind::Source,
+                | PanelKind::Text
+                | PanelKind::ReferenceMonitor
+                | PanelKind::Timecode => PanelKind::Source,
                 _ => PanelKind::Project,
             };
             self.ui.dock.open_near(p, near);
@@ -661,6 +664,16 @@ impl FilmcraftApp {
                     && !errs.is_empty()
                 {
                     self.ui.status = errs.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
+                }
+                r
+            }
+            // File ▸ Import with Image Sequence: choose the first numbered still
+            "file.importImageSequence" => {
+                let paths = self.hooks.pick_files.as_mut().map(|f| f(filmcraft_media::STILL_EXTENSIONS)).unwrap_or_default();
+                let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+                let r = self.session.execute("file.importImageSequence", json!({"path": path})).map_err(|e| e.to_string());
+                if let Err(e) = &r {
+                    self.ui.status = e.clone();
                 }
                 r
             }

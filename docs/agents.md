@@ -109,6 +109,9 @@ filmcraft-cli --project p.fcproj --save exec timeline.razor seconds=3.5
 filmcraft-cli --project p.fcproj exec effects.apply '{"effect":"Gaussian Blur"}'
 filmcraft-cli --project p.fcproj --save import a.mov b.wav
 filmcraft-cli --project p.fcproj export out.mp4  # format from the extension; waits for the job
+filmcraft-cli --project p.fcproj export out --preset "YouTube 1080p Full HD" --start 0 --end 10
+filmcraft-cli export --list-presets prores       # built-in + user presets (--data-dir for another library)
+filmcraft-cli --project p.fcproj exec export.queue.add preset="Apple ProRes 422 HQ" path=renders/ start=true wait=true
 echo '{"id":"file.newBin","params":{"name":"Selects"}}' | filmcraft-cli --project p.fcproj --save run -
 filmcraft-cli --bridge 127.0.0.1:9876 exec window.workspace.color   # the running app
 ```

@@ -5,20 +5,35 @@
 //! are shared atomics so the UI (Export mode, header progress) and MCP can observe/cancel jobs.
 //!
 //! Video encoders implement [`VideoEncoder`]; codec crates register theirs with
-//! [`register_encoder`] (H.264, ProRes …). Built in: Motion-JPEG (MOV), PNG sequence, GIF, WAV.
+//! [`register_encoder`] (H.264, ProRes …). Built in: Motion-JPEG (MOV), PNG / TIFF / BMP
+//! sequences, GIF, WAV and AIFF.
+//!
+//! [`ExportSettings`] carries every Export-mode setting (frame size, rate, bitrate encoding, audio
+//! format, multiplexer, captions, effects, metadata) as serde data; [`presets`] defines the
+//! built-in presets.
 
 use std::io::Write;
 
+mod audio_out;
 mod job;
+mod pcm;
+mod pipeline;
+pub mod presets;
+pub mod settings;
+pub use audio_out::LoudnessReport;
 pub use job::{Exporter, Step, stepped};
 #[cfg(target_os = "linux")]
 mod nvenc;
+pub use pcm::{image_sequence_path, write_aiff, write_wav};
+pub use pipeline::limit_rgba8;
+pub use presets::{ExportPreset, builtin_presets};
+pub use settings::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use filmcraft_isobmff::SampleEntry;
 use filmcraft_project::{ItemId, Project};
-use filmcraft_render::{RenderOptions, SourceProvider};
+use filmcraft_render::SourceProvider;
 use filmcraft_time::{FrameRate, Tick, TimeRange};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -39,19 +54,36 @@ pub enum ExportError {
 
 pub type Result<T> = std::result::Result<T, ExportError>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Format {
-    /// MPEG-4, H.264 video + AAC audio (needs the H.264/AAC encoders registered).
+    /// MPEG-4 (or QuickTime, see [`Multiplexer`]), H.264 video + AAC audio.
+    #[default]
+    #[serde(rename = "h264", alias = "H264")]
     H264,
-    /// QuickTime, Apple ProRes 422 HQ + PCM (needs the ProRes encoder registered).
+    /// QuickTime, Apple ProRes 422 (HQ unless the settings pick another flavour) + PCM.
+    #[serde(rename = "prores", alias = "ProRes")]
     ProRes,
     /// QuickTime, Avid DNxHR (HQ unless the settings pick another profile) + PCM.
+    #[serde(rename = "dnxhr", alias = "DnxHr")]
     DnxHr,
-    /// QuickTime, Motion-JPEG + 16-bit PCM.
+    /// QuickTime, Motion-JPEG + PCM.
+    #[serde(rename = "mjpeg", alias = "Mjpeg")]
     Mjpeg,
+    /// Numbered PNG stills ([`image_sequence_path`]).
+    #[serde(rename = "png", alias = "PngSequence")]
     PngSequence,
+    /// Numbered TIFF stills.
+    #[serde(rename = "tiff", alias = "TiffSequence")]
+    TiffSequence,
+    /// Numbered BMP stills.
+    #[serde(rename = "bmp", alias = "BmpSequence")]
+    BmpSequence,
+    #[serde(rename = "gif", alias = "Gif")]
     Gif,
+    #[serde(rename = "wav", alias = "Wav")]
     Wav,
+    #[serde(rename = "aiff", alias = "Aiff")]
+    Aiff,
 }
 
 /// Preferred H.264 encoder backend. `Auto` uses hardware when available and otherwise software.
@@ -67,23 +99,44 @@ pub enum VideoEncoderPreference {
 impl Format {
     pub fn from_name(s: &str) -> Option<Format> {
         Some(match s.to_ascii_lowercase().replace([' ', '-', '_', '.'], "").as_str() {
-            "h264" | "mp4" | "avc" => Format::H264,
-            "prores" | "mov" => Format::ProRes,
-            "dnxhr" | "dnxhd" | "dnx" | "avid" | "vc3" => Format::DnxHr,
+            "h264" | "mp4" | "avc" | "m4v" => Format::H264,
+            "prores" | "mov" | "appleprores" => Format::ProRes,
+            "dnxhr" | "dnxhd" | "dnx" | "avid" | "aviddnxhr" | "aviddnxhd" | "vc3" | "mxf" => Format::DnxHr,
             "mjpeg" | "motionjpeg" | "jpeg" => Format::Mjpeg,
             "png" | "pngsequence" => Format::PngSequence,
+            "tif" | "tiff" | "tiffsequence" => Format::TiffSequence,
+            "bmp" | "bmpsequence" => Format::BmpSequence,
             "gif" | "animatedgif" => Format::Gif,
-            "wav" | "waveform" => Format::Wav,
+            "wav" | "waveform" | "waveformaudio" => Format::Wav,
+            "aif" | "aiff" | "aifc" => Format::Aiff,
             _ => return None,
         })
+    }
+    /// Stable id, as accepted by [`Format::from_name`] and used in serialized settings.
+    pub fn id(self) -> &'static str {
+        match self {
+            Format::H264 => "h264",
+            Format::ProRes => "prores",
+            Format::DnxHr => "dnxhr",
+            Format::Mjpeg => "mjpeg",
+            Format::PngSequence => "png",
+            Format::TiffSequence => "tiff",
+            Format::BmpSequence => "bmp",
+            Format::Gif => "gif",
+            Format::Wav => "wav",
+            Format::Aiff => "aiff",
+        }
     }
     pub fn extension(self) -> &'static str {
         match self {
             Format::H264 => "mp4",
             Format::ProRes | Format::DnxHr | Format::Mjpeg => "mov",
             Format::PngSequence => "png",
+            Format::TiffSequence => "tif",
+            Format::BmpSequence => "bmp",
             Format::Gif => "gif",
             Format::Wav => "wav",
+            Format::Aiff => "aif",
         }
     }
     pub fn label(self) -> &'static str {
@@ -92,15 +145,40 @@ impl Format {
             Format::ProRes => "Apple ProRes",
             Format::DnxHr => "Avid DNxHR",
             Format::Mjpeg => "QuickTime (Motion JPEG)",
-            Format::PngSequence => "PNG Sequence",
+            Format::PngSequence => "PNG",
+            Format::TiffSequence => "TIFF",
+            Format::BmpSequence => "BMP",
             Format::Gif => "Animated GIF",
             Format::Wav => "Waveform Audio",
+            Format::Aiff => "AIFF",
         }
     }
-    pub const ALL: [Format; 7] = [Format::H264, Format::ProRes, Format::DnxHr, Format::Mjpeg, Format::PngSequence, Format::Gif, Format::Wav];
+    pub const ALL: [Format; 10] = [
+        Format::H264,
+        Format::ProRes,
+        Format::DnxHr,
+        Format::Mjpeg,
+        Format::PngSequence,
+        Format::TiffSequence,
+        Format::BmpSequence,
+        Format::Gif,
+        Format::Wav,
+        Format::Aiff,
+    ];
 }
 
+/// Two-pass state of an H.264 export (set by the exporter, not by callers).
+#[derive(Clone, Debug, Default)]
+pub enum H264Pass {
+    #[default]
+    Single,
+    First,
+    Second(filmcraft_h264enc::PassStats),
+}
+
+/// Every Export-mode setting. Serialized in camelCase; every field is optional on input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ExportSettings {
     pub format: Format,
     /// H.264 backend selection; ignored by formats with a dedicated encoder.
@@ -134,6 +212,41 @@ pub struct ExportSettings {
     /// sequence's HDR space and signal it (VUI / `colr` / `mdcv` / `clli` / SEI).
     #[serde(default)]
     pub sdr: bool,
+    /// Output frame size (None = Match Source: the sequence size times `scale`).
+    pub frame_size: Option<(u32, u32)>,
+    /// Output frame rate (None = Match Source).
+    pub frame_rate: Option<FrameRate>,
+    /// How the picture fills a frame of another aspect ratio.
+    pub scaling: Scaling,
+    /// Pixel aspect ratio (None = square pixels). Signalled in the H.264 VUI.
+    pub pixel_aspect: Option<(u32, u32)>,
+    pub field_order: FieldOrder,
+    pub h264_profile: H264Profile,
+    /// H.264 level × 10 (41 = 4.1); None = the lowest level that fits. A level below what the
+    /// stream needs is raised.
+    pub h264_level: Option<u8>,
+    pub bitrate_mode: BitrateMode,
+    /// VBR maximum bitrate (None = 1.5 × target).
+    pub max_bitrate_kbps: Option<u32>,
+    /// Adaptive bitrate (the Match Source presets): bits per pixel per frame; replaces
+    /// `bitrate_kbps` with `width × height × fps × bpp / 1000`.
+    pub adaptive_bitrate: Option<f32>,
+    /// Frames between keyframes (None = 2 seconds).
+    pub keyframe_distance: Option<u32>,
+    /// Render at Maximum Depth. FilmCraft always composites in 32-bit float, so this changes
+    /// nothing; it is kept so presets round-trip.
+    pub render_at_max_depth: bool,
+    /// Use Maximum Render Quality: render at full size and scale with an area filter.
+    pub max_render_quality: bool,
+    pub audio: AudioSettings,
+    pub multiplexer: Multiplexer,
+    /// Captions ▸ Create Sidecar File: `srt` or `vtt` next to the output (written by the engine).
+    pub caption_sidecar: Option<String>,
+    pub effects: ExportEffects,
+    pub metadata: ExportMetadata,
+    /// Two-pass state (set by the exporter).
+    #[serde(skip)]
+    pub h264_pass: H264Pass,
     /// Colour signalling chosen by [`export`] for the encoders (not set by callers).
     #[serde(skip)]
     pub signal: ColorSignal,
@@ -276,6 +389,25 @@ impl Default for ExportSettings {
             prores_profile: String::new(),
             dnx_profile: String::new(),
             sdr: false,
+            frame_size: None,
+            frame_rate: None,
+            scaling: Scaling::default(),
+            pixel_aspect: None,
+            field_order: FieldOrder::Progressive,
+            h264_profile: H264Profile::High,
+            h264_level: None,
+            bitrate_mode: BitrateMode::default(),
+            max_bitrate_kbps: None,
+            adaptive_bitrate: None,
+            keyframe_distance: None,
+            render_at_max_depth: false,
+            max_render_quality: false,
+            audio: AudioSettings::default(),
+            multiplexer: Multiplexer::Mp4,
+            caption_sidecar: None,
+            effects: ExportEffects::default(),
+            metadata: ExportMetadata::default(),
+            h264_pass: H264Pass::Single,
             signal: ColorSignal::default(),
             sink: None,
         }
@@ -294,6 +426,19 @@ pub fn hardware_encoder_available() -> bool {
     }
 }
 
+impl ExportSettings {
+    /// Reject settings the encoders cannot honour.
+    pub fn validate(&self) -> Result<()> {
+        if self.field_order != FieldOrder::Progressive && self.has_video() {
+            return Err(ExportError::Unsupported(format!("{} field order: FilmCraft's encoders write progressive frames", self.field_order.label())));
+        }
+        if self.effects.image_overlay.enabled && self.effects.image_overlay.path.trim().is_empty() {
+            return Err(ExportError::Unsupported("image overlay: no image file chosen".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Shared progress/cancel state of an export job.
 #[derive(Default)]
 pub struct Progress {
@@ -303,6 +448,8 @@ pub struct Progress {
     pub finished: AtomicBool,
     pub status: Mutex<String>,
     pub error: Mutex<Option<String>>,
+    /// What loudness normalization measured (when it ran).
+    pub loudness: Mutex<Option<LoudnessReport>>,
 }
 
 impl Progress {
@@ -356,6 +503,10 @@ pub trait VideoEncoder: Send {
     }
     /// Media start offset for an edit list (B-frame delay), in the encoder timescale.
     fn media_start(&self) -> Option<i64> {
+        None
+    }
+    /// First-pass statistics of a two-pass encode (H.264).
+    fn pass_stats(&self) -> Option<filmcraft_h264enc::PassStats> {
         None
     }
 }
@@ -472,9 +623,10 @@ impl AudioEncoder for AacEncoder {
     }
 }
 
-fn aac_factory(_format: Format, sample_rate: u32, channels: u32, _s: &ExportSettings) -> Option<Result<Box<dyn AudioEncoder>>> {
+fn aac_factory(_format: Format, sample_rate: u32, channels: u32, s: &ExportSettings) -> Option<Result<Box<dyn AudioEncoder>>> {
+    let bps = s.audio.bitrate_kbps.clamp(32, 512) * 1000;
     Some(
-        filmcraft_aac::Encoder::new(filmcraft_aac::EncoderConfig::cbr(sample_rate, channels as usize, 320_000))
+        filmcraft_aac::Encoder::new(filmcraft_aac::EncoderConfig::cbr(sample_rate, channels as usize, bps))
             .map(|enc| Box::new(AacEncoder { enc, rate: sample_rate, channels }) as Box<dyn AudioEncoder>)
             .map_err(|e| ExportError::Encode(e.to_string())),
     )
@@ -708,6 +860,9 @@ impl VideoEncoder for H264Encoder {
         // With B-frames the first DTS is one frame before the first PTS.
         (self.enc.delay() > 0).then_some(self.rate.den)
     }
+    fn pass_stats(&self) -> Option<filmcraft_h264enc::PassStats> {
+        self.enc.pass_stats()
+    }
 }
 
 /// BT.709 limited-range 8-bit 4:2:0 from straight RGBA8 (2×2 chroma average).
@@ -780,9 +935,27 @@ fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSetti
     let mut cfg = filmcraft_h264enc::EncoderConfig::new(w, h, rate.num as u32, rate.den as u32);
     cfg.format = filmcraft_h264enc::PacketFormat::LengthPrefixed;
     cfg.aud = false;
-    cfg.keyint = (rate.num as f64 / rate.den as f64 * 2.0).round().max(1.0) as u32;
+    cfg.keyint = s.keyframe_distance.filter(|k| *k > 0).unwrap_or_else(|| (rate.num as f64 / rate.den as f64 * 2.0).round().max(1.0) as u32);
     let kbps = s.bitrate_kbps.max(100);
-    cfg.rate = filmcraft_h264enc::RateControl::Vbr { target_kbps: kbps, max_kbps: kbps * 3 / 2 };
+    let max = s.max_bitrate_kbps.filter(|m| *m >= kbps).unwrap_or(kbps * 3 / 2);
+    cfg.rate = match s.bitrate_mode {
+        BitrateMode::Cbr => filmcraft_h264enc::RateControl::Cbr { kbps },
+        _ => filmcraft_h264enc::RateControl::Vbr { target_kbps: kbps, max_kbps: max },
+    };
+    cfg.pass = match &s.h264_pass {
+        H264Pass::Single => filmcraft_h264enc::Pass::Single,
+        H264Pass::First => filmcraft_h264enc::Pass::First,
+        H264Pass::Second(st) => filmcraft_h264enc::Pass::Second(st.clone()),
+    };
+    cfg.profile = match s.h264_profile {
+        H264Profile::Baseline => filmcraft_h264enc::Profile::Baseline,
+        H264Profile::Main => filmcraft_h264enc::Profile::Main,
+        H264Profile::High => filmcraft_h264enc::Profile::High,
+    };
+    cfg.level = s.h264_level;
+    if let Some((n, d)) = s.pixel_aspect {
+        cfg.sar = (n.clamp(1, 65535) as u16, d.clamp(1, 65535) as u16);
+    }
     if s.signal.is_hdr() {
         cfg.color = filmcraft_h264enc::ColorConfig { primaries: s.signal.primaries, transfer: s.signal.transfer, matrix: s.signal.matrix, full_range: false };
         if s.signal.transfer == 16 {
@@ -812,8 +985,49 @@ pub fn export_range(project: &Project, seq: ItemId, settings: &ExportSettings) -
     Ok(TimeRange::from_bounds(a, b.max(a + fd)))
 }
 
+/// Output frames `[f0, f1)` of `range` at `rate` (frame `f` is at `rate.tick_of(f)`).
+pub fn frame_span(rate: FrameRate, range: TimeRange) -> (i64, i64) {
+    let f0 = rate.frame_at(range.start);
+    let f1 = rate.frame_at(range.end() - Tick(1)) + 1;
+    (f0, f1.max(f0))
+}
+
+/// An in-memory writer that stays reachable after the encoder that owns a clone is dropped.
+#[derive(Clone, Default)]
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Encode one still of an image sequence.
+fn encode_still(format: Format, rgba: Vec<u8>, w: u32, h: u32) -> Result<Vec<u8>> {
+    let enc = |e: image::ImageError| ExportError::Encode(e.to_string());
+    let mut out = std::io::Cursor::new(Vec::new());
+    match format {
+        Format::PngSequence => {
+            image::ImageEncoder::write_image(image::codecs::png::PngEncoder::new(&mut out), &rgba, w, h, image::ExtendedColorType::Rgba8).map_err(enc)?
+        }
+        Format::TiffSequence | Format::BmpSequence => {
+            let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| ExportError::Encode("frame size".into()))?;
+            let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+            let f = if format == Format::TiffSequence { image::ImageFormat::Tiff } else { image::ImageFormat::Bmp };
+            rgb.write_to(&mut out, f).map_err(enc)?
+        }
+        _ => return Err(ExportError::Unsupported(format!("{} is not an image sequence", format.label()))),
+    }
+    Ok(out.into_inner())
+}
+
 /// Run an export (blocking; call from a worker thread).
 pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, sources: &dyn SourceProvider, progress: &Progress) -> Result<Report> {
+    settings.validate()?;
     if stepped(settings.format) {
         let mut ex = Exporter::new(project.clone(), seq, settings, progress)?;
         loop {
@@ -826,97 +1040,79 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
         }
     }
     let t0 = web_time::Instant::now();
-    let q = project.sequence(seq).ok_or(ExportError::NoSequence)?;
-    let rate = q.settings.frame_rate;
     let range = export_range(project, seq, settings)?;
-    let f0 = rate.frame_at(range.start);
-    let f1 = rate.frame_at(range.end() - Tick(1)) + 1;
-    let nframes = (f1 - f0).max(0) as u64;
-    let w = (((q.settings.width as f32 * settings.scale).round() as u32).max(2)) & !1;
-    let h = (((q.settings.height as f32 * settings.scale).round() as u32).max(2)) & !1;
-    if !settings.part_of_batch {
-        progress.total.store(if settings.format == Format::Wav { 1 } else { nframes }, Ordering::Relaxed);
-        progress.set_status(format!("Exporting {} frames ({})", nframes, settings.format.label()));
-    }
-    let opts = RenderOptions { scale: w as f32 / q.settings.width as f32, captions: settings.burn_captions, ..Default::default() };
-    let render = |f: i64| -> Vec<u8> {
-        let img = filmcraft_render::render_sequence(project, seq, rate.tick_of(f), opts, sources);
-        let mut rgba = img.over_black_rgba8();
-        if img.w as u32 != w || img.h as u32 != h {
-            // even-size crop/pad
-            let mut out = vec![0u8; (w * h * 4) as usize];
-            for y in 0..(h as usize).min(img.h) {
-                let n = (w as usize).min(img.w) * 4;
-                out[y * w as usize * 4..y * w as usize * 4 + n].copy_from_slice(&rgba[y * img.w * 4..y * img.w * 4 + n]);
-            }
-            rgba = out;
-        }
-        rgba
-    };
+    let cancelled = || progress.cancel.load(Ordering::Relaxed);
     let batch = rayon::current_num_threads().clamp(2, 16) as i64;
-    let sr = q.settings.sample_rate;
-    let bytes = match settings.format {
-        Format::Wav => {
-            let n = range.duration.to_units_floor(sr as i64) as usize;
-            let buf = filmcraft_render::audio::mix_sequence(project, q, range.start.to_units_floor(sr as i64), n, sources);
-            let data = filmcraft_media::wav::write_wav16(&buf.interleaved(), 2, sr);
+    let (bytes, nframes) = match settings.format {
+        Format::Wav | Format::Aiff => {
+            if !settings.part_of_batch {
+                progress.total.store(1, Ordering::Relaxed);
+                progress.set_status(format!("Exporting audio ({})", settings.format.label()));
+            }
+            let mut a = audio_out::AudioOut::new(project.clone(), seq, settings, range)?;
+            a.measure(settings, sources, &cancelled)?;
+            *progress.loudness.lock().unwrap_or_else(|e| e.into_inner()) = a.loudness;
+            let planar = a.rest(sources).unwrap_or_else(|| vec![Vec::new(); a.channels]);
+            let inter = audio_out::interleave(&planar);
+            let (ch, sr, bits) = (a.channels as u16, a.sr, settings.audio.bits);
+            let data = if settings.format == Format::Wav { pcm::write_wav(&inter, ch, sr, bits) } else { pcm::write_aiff(&inter, ch, sr, bits) };
             let n = write_output(settings, &settings.path, data)?;
             progress.done.store(1, Ordering::Relaxed);
-            n
+            (n, planar.first().map_or(0, Vec::len) as u64)
         }
-        Format::PngSequence => {
-            let base = settings.path.trim_end_matches(".png").to_string();
+        Format::PngSequence | Format::TiffSequence | Format::BmpSequence | Format::Gif => {
+            let pipe = pipeline::Pipeline::new(project.clone(), seq, settings, false)?;
+            let (f0, f1) = frame_span(pipe.rate, range);
+            let count = (f1 - f0) as u64;
+            let (w, h) = (pipe.w, pipe.h);
+            if !settings.part_of_batch {
+                progress.total.store(count, Ordering::Relaxed);
+                progress.set_status(format!("Exporting {count} frames ({})", settings.format.label()));
+            }
             let mut total = 0u64;
+            let gif_buf = SharedBuf::default();
+            let mut gif = if settings.format == Format::Gif {
+                let mut enc = image::codecs::gif::GifEncoder::new_with_speed(gif_buf.clone(), 10);
+                enc.set_repeat(image::codecs::gif::Repeat::Infinite).map_err(|e| ExportError::Encode(e.to_string()))?;
+                Some(enc)
+            } else {
+                None
+            };
+            let delay = image::Delay::from_numer_denom_ms((1000 * pipe.rate.den) as u32, pipe.rate.num as u32);
             let mut f = f0;
             while f < f1 {
-                if progress.cancel.load(Ordering::Relaxed) {
+                if cancelled() {
                     return Err(ExportError::Cancelled);
                 }
                 let end = (f + batch).min(f1);
-                let written: Vec<Result<u64>> = (f..end)
-                    .into_par_iter()
-                    .map(|fi| {
-                        let rgba = render(fi);
-                        let path = format!("{base}_{:05}.png", fi - f0);
-                        if settings.sink.is_some() {
-                            let mut png = Vec::new();
-                            image::ImageEncoder::write_image(image::codecs::png::PngEncoder::new(&mut png), &rgba, w, h, image::ExtendedColorType::Rgba8)
-                                .map_err(|e| ExportError::Encode(e.to_string()))?;
-                            return write_output(settings, &path, png);
-                        }
-                        image::save_buffer(&path, &rgba, w, h, image::ExtendedColorType::Rgba8).map_err(|e| ExportError::Io(e.to_string()))?;
-                        Ok(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0))
-                    })
-                    .collect();
-                for r in written {
-                    total += r?;
+                if let Some(enc) = gif.as_mut() {
+                    let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(|fi| pipe.frame(fi, sources).0).collect();
+                    for rgba in frames {
+                        let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| ExportError::Encode("frame".into()))?;
+                        enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).map_err(|e| ExportError::Encode(e.to_string()))?;
+                    }
+                } else {
+                    let written: Vec<Result<u64>> = (f..end)
+                        .into_par_iter()
+                        .map(|fi| {
+                            let data = encode_still(settings.format, pipe.frame(fi, sources).0, w, h)?;
+                            write_output(settings, &pcm::image_sequence_path(&settings.path, (fi - f0) as u64, count), data)
+                        })
+                        .collect();
+                    for r in written {
+                        total += r?;
+                    }
                 }
                 progress.done.fetch_add((end - f) as u64, Ordering::Relaxed);
                 f = end;
             }
-            total
-        }
-        Format::Gif => {
-            let mut out = Out::create(settings)?;
-            let mut enc = image::codecs::gif::GifEncoder::new_with_speed(&mut out, 10);
-            enc.set_repeat(image::codecs::gif::Repeat::Infinite).map_err(|e| ExportError::Encode(e.to_string()))?;
-            let delay = image::Delay::from_numer_denom_ms((1000 * rate.den) as u32, rate.num as u32);
-            let mut f = f0;
-            while f < f1 {
-                if progress.cancel.load(Ordering::Relaxed) {
-                    return Err(ExportError::Cancelled);
-                }
-                let end = (f + batch).min(f1);
-                let frames: Vec<Vec<u8>> = (f..end).into_par_iter().map(render).collect();
-                for rgba in frames {
-                    let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| ExportError::Encode("frame".into()))?;
-                    enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay)).map_err(|e| ExportError::Encode(e.to_string()))?;
-                }
-                progress.done.fetch_add((end - f) as u64, Ordering::Relaxed);
-                f = end;
+            if let Some(enc) = gif {
+                let buf = gif_buf.clone();
+                drop(enc);
+                let data = std::mem::take(&mut *buf.0.lock().unwrap_or_else(|e| e.into_inner()));
+                total = write_output(settings, &settings.path, data)?;
             }
-            drop(enc);
-            out.finish(settings)?
+            (total, count)
         }
         Format::H264 | Format::ProRes | Format::DnxHr | Format::Mjpeg => unreachable!("stepped export"),
     };
@@ -930,3 +1126,6 @@ pub fn export(project: &Arc<Project>, seq: ItemId, settings: &ExportSettings, so
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod settings_tests;

@@ -3,7 +3,23 @@
 use serde_json::{Map, Value};
 
 /// Options that take a value (`--project p`); every other `--x` is a flag.
-const VALUED: &[&str] = &["--project", "--save-as", "--bridge", "--format", "--scale", "--quality", "--seconds", "--out", "--frames"];
+const VALUED: &[&str] = &[
+    "--project",
+    "--save-as",
+    "--bridge",
+    "--format",
+    "--scale",
+    "--quality",
+    "--seconds",
+    "--out",
+    "--frames",
+    "--preset",
+    "--range",
+    "--start",
+    "--end",
+    "--data-dir",
+    "--settings",
+];
 
 #[derive(Debug, Default)]
 pub struct Args {

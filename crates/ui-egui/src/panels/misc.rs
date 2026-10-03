@@ -1,10 +1,9 @@
-//! Smaller panels: History, Markers, Info, Media Browser, Lumetri Scopes.
+//! Smaller panels: History, Markers, Info, Media Browser.
 
 use egui::{Align2, Color32, Rect, Sense, pos2, vec2};
 use filmcraft_time::{TimeDisplay, format_time};
 
 use crate::FilmcraftApp;
-use crate::frames::{FrameKey, Target};
 use crate::theme::Tokens;
 
 pub fn history(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -208,6 +207,7 @@ pub fn media_browser(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             .unwrap_or_default();
         entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.to_lowercase().cmp(&b.1.to_lowercase())));
         let mut import = Vec::new();
+        let mut import_sequence = None;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (is_dir, name) in &entries {
                 let path = format!("{dir}/{name}");
@@ -238,11 +238,36 @@ pub fn media_browser(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         import.push(path.clone());
                     }
                 }
+                if !*is_dir {
+                    resp.context_menu(|ui| {
+                        let b = ui.button("Import");
+                        app.auto.add(&format!("mediaBrowser.import.{name}"), b.rect, "Import");
+                        if b.clicked() {
+                            import.push(path.clone());
+                            ui.close();
+                        }
+                        // numbered stills: the sequence starting at this frame, as one clip
+                        if filmcraft_media::sequence::Numbered::parse(&path).is_some() {
+                            let b = ui.button("Import as Image Sequence");
+                            app.auto.add(&format!("mediaBrowser.importSequence.{name}"), b.rect, "Import as Image Sequence");
+                            if b.clicked() {
+                                import_sequence = Some(path.clone());
+                                ui.close();
+                            }
+                        }
+                    });
+                }
             }
         });
         ui.data_mut(|d| d.insert_temp(dir_id, dir));
         if !import.is_empty() {
             let r = app.session.execute("file.import", serde_json::json!({"paths": import, "background": !cfg!(target_arch = "wasm32")}));
+            if let Err(e) = r {
+                app.ui.status = e.to_string();
+            }
+        }
+        if let Some(first) = import_sequence {
+            let r = app.session.execute("file.importFromMediaBrowser", serde_json::json!({"paths": [first], "imageSequence": true}));
             if let Err(e) = r {
                 app.ui.status = e.to_string();
             }
@@ -254,123 +279,4 @@ pub fn media_browser(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         ui.label(egui::RichText::new("Use File ▸ Import, or drop files on the window.").color(t.text_dim));
     }
     let _ = t;
-}
-
-/// Lumetri Scopes: luma waveform + vectorscope of the program frame.
-pub fn scopes(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
-    let t = app.tokens;
-    let Some(seq_id) = app.session.state.active_sequence else { return };
-    let rate = app.session.sequence_rate();
-    let frame = rate.frame_at(app.session.playhead());
-    let key = FrameKey { target: Target::Sequence(seq_id), frame, size: 250, revision: app.session.revision };
-    let project = app.session.project.clone();
-    // While playing, scopes come after the Program monitor's prefetch.
-    let prio = if app.playback.playing { 40 } else { 2 };
-    app.frames.request(key, rate.tick_of(frame), 0.25, &project, prio);
-    let pipe = app.session.active_sequence().map(|q| q.settings.color).unwrap_or(filmcraft_color::ColorPipeline::REC709);
-    if pipe.working.is_hdr() {
-        hdr_scopes(app, ui, rect, (seq_id.0, frame, app.session.revision));
-        return;
-    }
-    let Some(img) = app.frames.get(&key) else {
-        crate::dock::placeholder(ui, rect, &t, "…");
-        return;
-    };
-    let half = rect.width() / 2.0;
-    let wf = Rect::from_min_size(rect.min + vec2(8.0, 8.0), vec2(half - 12.0, rect.height() - 16.0));
-    let vs_size = (rect.height() - 16.0).min(half - 12.0);
-    let vs = Rect::from_center_size(pos2(rect.min.x + half + half / 2.0, rect.center().y), vec2(vs_size, vs_size));
-    ui.painter().rect_filled(wf, 0.0, Color32::BLACK);
-    ui.painter().rect_filled(vs, vs_size / 2.0, Color32::BLACK);
-    // waveform: plot luma per column
-    let mut mesh = egui::Mesh::default();
-    let (w, h) = (img.w, img.h);
-    let step_y = (h / 90).max(1);
-    for x in (0..w).step_by((w / wf.width().max(1.0) as usize).max(1)) {
-        for y in (0..h).step_by(step_y) {
-            let i = (y * w + x) * 4;
-            let l = 0.2126 * img.px[i] as f32 + 0.7152 * img.px[i + 1] as f32 + 0.0722 * img.px[i + 2] as f32;
-            let px = wf.min.x + x as f32 / w as f32 * wf.width();
-            let py = wf.max.y - l / 255.0 * wf.height();
-            mesh.add_colored_rect(Rect::from_min_size(pos2(px, py), vec2(1.0, 1.0)), Color32::from_rgba_unmultiplied(120, 255, 140, 60));
-            // vectorscope
-            let (r, g, b) = (img.px[i] as f32 / 255.0, img.px[i + 1] as f32 / 255.0, img.px[i + 2] as f32 / 255.0);
-            let ycc = filmcraft_color::rgb_to_ycbcr(r, g, b, filmcraft_color::Matrix::Bt709);
-            let vx = vs.center().x + ycc[1] * vs_size;
-            let vy = vs.center().y - ycc[2] * vs_size;
-            mesh.add_colored_rect(Rect::from_min_size(pos2(vx, vy), vec2(1.0, 1.0)), Color32::from_rgba_unmultiplied(200, 255, 200, 50));
-        }
-    }
-    ui.painter().add(mesh);
-    for v in [0, 25, 50, 75, 100] {
-        let y = wf.max.y - v as f32 / 100.0 * wf.height();
-        ui.painter().line_segment([pos2(wf.min.x, y), pos2(wf.max.x, y)], egui::Stroke::new(0.5, Color32::from_white_alpha(30)));
-        ui.painter().text(pos2(wf.min.x + 2.0, y - 6.0), Align2::LEFT_CENTER, v.to_string(), Tokens::ui(8.0), t.text_faint);
-    }
-    ui.painter().circle_stroke(vs.center(), vs_size / 2.0, egui::Stroke::new(1.0, Color32::from_white_alpha(40)));
-}
-
-/// Nits → waveform height (0..1) on the PQ scale used by HDR waveforms.
-fn pq_axis(nits: f32) -> f32 {
-    filmcraft_color::pq_inverse_eotf((nits / 10_000.0).clamp(0.0, 1.0))
-}
-
-/// Scopes of an HDR (Rec. 2100 PQ/HLG) sequence: luminance waveform in cd/m² on a PQ-scaled
-/// axis (0–10 000 nits, reference white 203 marked) and a BT.2020 vectorscope. The frame is the
-/// sequence rendered in its working space (HDR values kept), small and cached per frame.
-fn hdr_scopes(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, key: (u64, i64, u64)) {
-    use std::sync::Mutex;
-    static CACHE: Mutex<Option<((u64, i64, u64), filmcraft_render::Image)>> = Mutex::new(None);
-    let t = app.tokens;
-    let img = {
-        let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if c.as_ref().is_none_or(|(k, _)| *k != key)
-            && let Some(img) = app.session.render_program_working(0.125)
-        {
-            *c = Some((key, img));
-        }
-        c.as_ref().map(|(_, i)| i.clone())
-    };
-    let Some(img) = img else {
-        crate::dock::placeholder(ui, rect, &t, "…");
-        return;
-    };
-    let half = rect.width() / 2.0;
-    let wf = Rect::from_min_size(rect.min + vec2(34.0, 8.0), vec2(half - 38.0, rect.height() - 16.0));
-    let vs_size = (rect.height() - 16.0).min(half - 12.0);
-    let vs = Rect::from_center_size(pos2(rect.min.x + half + half / 2.0, rect.center().y), vec2(vs_size, vs_size));
-    ui.painter().rect_filled(wf, 0.0, Color32::BLACK);
-    ui.painter().rect_filled(vs, vs_size / 2.0, Color32::BLACK);
-    let luma = filmcraft_color::Gamut::Bt2020.luma();
-    let (w, h) = (img.w, img.h);
-    let mut mesh = egui::Mesh::default();
-    let mut peak = 0f32;
-    for y in 0..h {
-        for x in 0..w {
-            let p = img.get(x, y);
-            let a = p[3].max(1e-6);
-            let c = [p[0] / a, p[1] / a, p[2] / a];
-            let nits = (luma[0] as f32 * c[0] + luma[1] as f32 * c[1] + luma[2] as f32 * c[2]).max(0.0) * filmcraft_color::REFERENCE_WHITE_NITS as f32;
-            peak = peak.max(nits);
-            let px = wf.min.x + x as f32 / w as f32 * wf.width();
-            let py = wf.max.y - pq_axis(nits) * wf.height();
-            mesh.add_colored_rect(Rect::from_min_size(pos2(px, py), vec2(1.5, 1.0)), Color32::from_rgba_unmultiplied(120, 255, 140, 70));
-            // vectorscope on PQ-encoded BT.2020 Y'CbCr
-            let e = c.map(|v| pq_axis(v.max(0.0) * filmcraft_color::REFERENCE_WHITE_NITS as f32));
-            let ycc = filmcraft_color::rgb_to_ycbcr(e[0], e[1], e[2], filmcraft_color::Matrix::Bt2020Ncl);
-            let vx = vs.center().x + ycc[1] * vs_size;
-            let vy = vs.center().y - ycc[2] * vs_size;
-            mesh.add_colored_rect(Rect::from_min_size(pos2(vx, vy), vec2(1.0, 1.0)), Color32::from_rgba_unmultiplied(200, 255, 200, 60));
-        }
-    }
-    ui.painter().add(mesh);
-    for (nits, label) in [(0.0, "0"), (10.0, "10"), (100.0, "100"), (203.0, "203"), (1000.0, "1000"), (4000.0, "4000"), (10_000.0, "10000")] {
-        let y = wf.max.y - pq_axis(nits) * wf.height();
-        let col = if nits == 203.0 { Color32::from_rgba_unmultiplied(255, 200, 80, 90) } else { Color32::from_white_alpha(30) };
-        ui.painter().line_segment([pos2(wf.min.x, y), pos2(wf.max.x, y)], egui::Stroke::new(0.5, col));
-        ui.painter().text(pos2(wf.min.x - 3.0, y), Align2::RIGHT_CENTER, label, Tokens::ui(8.0), t.text_faint);
-    }
-    ui.painter().text(wf.left_top() + vec2(4.0, 4.0), Align2::LEFT_TOP, format!("HDR · cd/m² · peak {peak:.0}"), Tokens::ui(9.0), t.text_dim);
-    app.auto.add("scopes.hdrWaveform", wf, &format!("HDR waveform, peak {peak:.0} nits"));
-    ui.painter().circle_stroke(vs.center(), vs_size / 2.0, egui::Stroke::new(1.0, Color32::from_white_alpha(40)));
 }

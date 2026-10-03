@@ -206,7 +206,8 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             if paths.is_empty() {
                 return Some(Err("select files in the Media Browser".into()));
             }
-            return Some(app.session.execute(id, json!({"paths": paths})).map_err(|e| e.to_string()));
+            let seq = params.get("imageSequence").and_then(Value::as_bool).unwrap_or(false);
+            return Some(app.session.execute(id, json!({"paths": paths, "imageSequence": seq})).map_err(|e| e.to_string()));
         }
         "file.exportSelectionProject" | "file.exportAle" if params.get("path").is_none() => {
             if let Err(e) = enabled(app, id) {

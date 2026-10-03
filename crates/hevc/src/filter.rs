@@ -424,36 +424,59 @@ fn sao_ctb(
         true
     };
     let edge_map = [1usize, 2, 0, 3, 4];
+    // Offset per (2 + sum of neighbour signs); edgeIdx 0 adds nothing.
+    let by_sum = edge_map.map(|e| if e == 0 { 0 } else { offs[e - 1] });
+    // Any sample: neighbours outside the picture or in a CTB that may not be used leave it as is.
+    let general = |x: usize, y: usize| -> Option<u16> {
+        if any_nofilter && nofilter(pic, x, y) {
+            return None;
+        }
+        let mut sum = 0i32;
+        let v = pic.planes[c][y * w + x] as i32;
+        for k in 0..2 {
+            let xn = x as i32 + hp[k];
+            let yn = y as i32 + vp[k];
+            if xn < 0 || yn < 0 || xn >= w as i32 || yn >= h as i32 {
+                return None;
+            }
+            let (xn, yn) = (xn as usize, yn as usize);
+            if (xn < x0 || xn >= x1 || yn < y0 || yn >= y1) && !cross_ok(pic, xn, yn) {
+                return None;
+            }
+            sum += (v - pic.planes[c][yn * w + xn] as i32).signum();
+        }
+        Some((v + by_sum[(2 + sum) as usize]).clamp(0, max) as u16)
+    };
+    // Samples whose two neighbours lie inside this CTB need none of those checks: a tight loop
+    // (same arithmetic) for them, the general path for the CTB border.
+    let (mx, my) = ((hp[0] != 0) as usize, (vp[0] != 0) as usize);
+    let plane = &pic.planes[c];
     for y in y0..y1 {
-        for x in x0..x1 {
-            if any_nofilter && nofilter(pic, x, y) {
-                continue;
-            }
-            let mut ok = true;
-            let mut sum = 0i32;
-            let v = pic.planes[c][y * w + x] as i32;
-            for k in 0..2 {
-                let xn = x as i32 + hp[k];
-                let yn = y as i32 + vp[k];
-                if xn < 0 || yn < 0 || xn >= w as i32 || yn >= h as i32 {
-                    ok = false;
-                    break;
+        let inner_row = !any_nofilter && y >= y0 + my && y + my < y1 && x1 - x0 > 2 * mx;
+        if !inner_row {
+            for x in x0..x1 {
+                if let Some(v) = general(x, y) {
+                    dst[(y - y0) * w + x] = v;
                 }
-                let (xn, yn) = (xn as usize, yn as usize);
-                if (xn < x0 || xn >= x1 || yn < y0 || yn >= y1) && !cross_ok(pic, xn, yn) {
-                    ok = false;
-                    break;
-                }
-                sum += (v - pic.planes[c][yn * w + xn] as i32).signum();
             }
-            if !ok {
-                continue;
+            continue;
+        }
+        for x in (x0..x0 + mx).chain(x1 - mx..x1) {
+            if let Some(v) = general(x, y) {
+                dst[(y - y0) * w + x] = v;
             }
-            let edge_idx = edge_map[(2 + sum) as usize];
-            if edge_idx == 0 {
-                continue;
-            }
-            dst[(y - y0) * w + x] = (v + offs[edge_idx - 1]).clamp(0, max) as u16;
+        }
+        let (ya, yb) = ((y as i32 + vp[0]) as usize, (y as i32 + vp[1]) as usize);
+        let (xa, xb) = (x0 as i32 + mx as i32 + hp[0], x0 as i32 + mx as i32 + hp[1]);
+        let n = x1 - x0 - 2 * mx;
+        let cur = &plane[y * w + x0 + mx..][..n];
+        let na = &plane[ya * w + xa as usize..][..n];
+        let nb = &plane[yb * w + xb as usize..][..n];
+        let out = &mut dst[(y - y0) * w + x0 + mx..][..n];
+        for i in 0..n {
+            let v = cur[i] as i32;
+            let sum = (v - na[i] as i32).signum() + (v - nb[i] as i32).signum();
+            out[i] = (v + by_sum[(2 + sum) as usize]).clamp(0, max) as u16;
         }
     }
 }

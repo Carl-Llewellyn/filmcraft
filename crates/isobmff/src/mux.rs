@@ -100,6 +100,9 @@ struct Tables {
     /// (offset relative to file start before shifting, sample count)
     chunks: Vec<(u64, u32)>,
     media_duration: u64,
+    /// End of the last sample on the composition timeline (decode time + composition offset +
+    /// duration, maximum over samples).
+    comp_end: u64,
 }
 
 impl Tables {
@@ -176,7 +179,9 @@ fn effective_edits(t: &WTrack, movie_ts: u32) -> Vec<Edit> {
         return t.cfg.edits.clone();
     }
     if let Some(start) = t.cfg.media_start {
-        let rest = t.t.media_duration.saturating_sub(start.max(0) as u64);
+        // presentation runs from `start` to the end of the last sample in composition order (with
+        // B-frame reordering that is past the end of the decode timeline)
+        let rest = t.t.comp_end.max(t.t.media_duration).saturating_sub(start.max(0) as u64);
         return vec![Edit { segment_duration: rescale(rest, t.cfg.timescale, movie_ts), media_time: start, media_rate: 0x10000 }];
     }
     Vec::new()
@@ -602,6 +607,8 @@ impl<W: Write + Seek> Mp4Writer<W> {
             }
         }
         t.sample_count += count as u64;
+        let ct = if tr.pcm_frame_bytes.is_some() { 0 } else { s.composition_offset as i64 };
+        t.comp_end = t.comp_end.max((t.media_duration as i64 + ct + count as i64 * dur as i64).max(0) as u64);
         t.media_duration += count as u64 * dur as u64;
         match t.chunks.last_mut() {
             Some(c) if contiguous => c.1 += count,

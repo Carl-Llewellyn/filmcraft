@@ -295,6 +295,13 @@ pub fn avcc(sps_nal: &[u8], pps_nal: &[u8], profile_idc: u8, constraint: u8, lev
     v
 }
 
+/// The requested level when it is at least `needed` (and a valid level_idc), else `needed`.
+/// Level 1b (`11` with constraint_set3) is not distinguished; 9 is not a level here.
+pub fn level_at_least(requested: u8, needed: u8) -> u8 {
+    const VALID: [u8; 19] = [10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62];
+    if VALID.contains(&requested) && requested >= needed { requested } else { needed }
+}
+
 /// Pick the lowest level satisfying frame size, macroblock rate, DPB size and (optionally) bitrate.
 pub fn pick_level(width_mbs: u32, height_mbs: u32, fps: f64, dpb_frames: u32, kbps: Option<u32>, high: bool) -> u8 {
     // (level_idc, MaxMBPS, MaxFS, MaxDpbMbs, MaxBR kbit/s)

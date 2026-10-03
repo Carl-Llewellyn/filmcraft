@@ -5,7 +5,7 @@ use filmcraft_project::{ItemKind, Label, MediaClip, MediaRef, SequenceSettings, 
 use filmcraft_render::SourceMap;
 use filmcraft_time::TICKS_PER_SECOND;
 
-fn project() -> (Arc<Project>, ItemId, SourceMap) {
+pub(crate) fn project() -> (Arc<Project>, ItemId, SourceMap) {
     let mut p = Project::new("x");
     let g = GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }, 320, 180, FrameRate::FPS_24, Tick(2 * TICKS_PER_SECOND));
     let tone = GeneratorSource::new(Generator::Tone { hz: 440.0, db: -6.0 }, 320, 180, FrameRate::FPS_24, Tick(2 * TICKS_PER_SECOND));
@@ -86,7 +86,7 @@ fn wav_png_gif() {
         let r = export(&p, seq, &s, &m, &prog).unwrap();
         assert!(r.bytes > 0, "{fmt:?}");
     }
-    assert!(std::path::Path::new(&tmp("seq_00005.png")).exists());
+    assert!(std::path::Path::new(&tmp("seq005.png")).exists());
 }
 
 #[test]

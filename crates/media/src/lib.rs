@@ -13,6 +13,7 @@ pub mod digits;
 pub mod generators;
 pub mod pending;
 pub mod reader;
+pub mod sequence;
 pub mod still;
 pub mod wav;
 

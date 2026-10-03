@@ -55,6 +55,10 @@ struct Job {
     cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Queued by playback prefetch (dropped when playback stops).
     prefetch: bool,
+    /// While playing: how far before this frame the frames are late (the playhead's distance;
+    /// zero for the frame due now), so a decoder catching up may skip pictures only late frames
+    /// need (`filmcraft_media::cancel::with_catch_up`).
+    catch_up: Option<Tick>,
     time: Tick,
     /// Output scale relative to the target's frame size.
     scale: f32,
@@ -77,6 +81,55 @@ struct Shared {
     /// started, and the workers can finish at most `workers / cost` of them per second.
     render_cost: Mutex<f64>,
     workers: usize,
+    /// Always-on counters for `perf.stats`.
+    stats: Mutex<FrameStats>,
+}
+
+/// Cumulative frame-job statistics (`perf.stats`): cheap enough to keep on all the time.
+#[derive(Clone, Debug, Default)]
+pub struct FrameStats {
+    /// Jobs finished (including cancelled ones).
+    pub jobs: u64,
+    pub cancelled: u64,
+    /// Jobs served from a render preview.
+    pub preview: u64,
+    /// Playback prefetch jobs.
+    pub prefetch: u64,
+    /// Requests answered by a cached frame or one already queued / running.
+    pub request_hits: u64,
+    /// Requests that queued a new job.
+    pub request_misses: u64,
+    /// Totals over all jobs (ms): getting source frames (decode), the rest (render), whole job.
+    pub source_ms: f64,
+    pub render_ms: f64,
+    pub job_ms: f64,
+    /// The most recent jobs: (source ms, render ms).
+    pub recent: VecDeque<(f32, f32)>,
+}
+
+impl FrameStats {
+    const RECENT: usize = 256;
+
+    /// JSON for `perf.stats`.
+    pub fn to_json(&self) -> serde_json::Value {
+        let pct = |f: &dyn Fn(&(f32, f32)) -> f32, p: f64| -> f64 {
+            let mut v: Vec<f32> = self.recent.iter().map(f).collect();
+            if v.is_empty() {
+                return 0.0;
+            }
+            v.sort_by(|a, b| a.total_cmp(b));
+            v[((v.len() - 1) as f64 * p).round() as usize] as f64
+        };
+        let n = self.jobs.max(1) as f64;
+        let req = self.request_hits + self.request_misses;
+        serde_json::json!({
+            "jobs": self.jobs, "cancelled": self.cancelled, "previewJobs": self.preview, "prefetchJobs": self.prefetch,
+            "requestHitRate": if req == 0 { 0.0 } else { self.request_hits as f64 / req as f64 },
+            "decodeMs": {"mean": self.source_ms / n, "p50": pct(&|r| r.0, 0.5), "p95": pct(&|r| r.0, 0.95)},
+            "renderMs": {"mean": self.render_ms / n, "p50": pct(&|r| r.1, 0.5), "p95": pct(&|r| r.1, 0.95)},
+            "jobMsMean": self.job_ms / n,
+        })
+    }
 }
 
 /// Timing of one finished frame job (collected while [`FrameServer::set_profiling`] is on).
@@ -278,6 +331,10 @@ pub fn prefetch_depth(speed: f64) -> i64 {
 /// [`PREROLL_TIMEOUT_S`]: otherwise the first frames after Play are due before any decoder had a
 /// chance to produce them (a seek decodes from the previous keyframe).
 pub const PREROLL_FRAMES: i64 = 6;
+
+/// Seconds before a scrubbed-to frame whose frames a seek still decodes in full (see
+/// [`FrameServer::request`]); earlier non-reference pictures are skipped on the way.
+pub const SCRUB_KEEP_S: f64 = 2.0;
 pub const PREROLL_TIMEOUT_S: f64 = 0.5;
 
 /// Which frames playback asks for, given the per-frame render cost (s), the displayed frame rate
@@ -325,6 +382,7 @@ impl FrameServer {
             records: Mutex::new(Vec::new()),
             render_cost: Mutex::new(0.0),
             workers: workers.max(1),
+            stats: Mutex::new(FrameStats::default()),
         });
         let repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
         #[cfg(not(target_arch = "wasm32"))]
@@ -363,6 +421,26 @@ impl FrameServer {
         std::mem::take(&mut *self.shared.records.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// Cumulative job statistics (`perf.stats`).
+    pub fn stats(&self) -> FrameStats {
+        self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Worker threads.
+    pub fn workers(&self) -> usize {
+        self.shared.workers
+    }
+
+    /// (cached images, their bytes, cached GPU plans, their bytes).
+    pub fn cache_entries(&self) -> (usize, usize, usize, usize) {
+        let (n, b) = {
+            let c = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
+            (c.map.len(), c.bytes)
+        };
+        let p = self.shared.plans.lock().unwrap_or_else(|e| e.into_inner());
+        (n, b, p.map.len(), p.bytes)
+    }
+
     pub fn get(&self, k: &FrameKey) -> Option<Arc<Rgba>> {
         let mut c = self.shared.done.lock().unwrap_or_else(|e| e.into_inner());
         c.clock += 1;
@@ -395,25 +473,41 @@ impl FrameServer {
     }
 
     /// Queue a job unless it is cached, queued or in flight.
+    ///
+    /// The frame on screen (`prio` 0: scrubbing, a seek) treats frames more than
+    /// [`SCRUB_KEEP_S`] before it as not wanted: a decoder seeking from a keyframe skips their
+    /// non-reference pictures, while nearby frames stay decoded (and cached) for scrubbing back.
     pub fn request(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32) {
-        self.request_job(key, time, scale, project, prio, false);
+        let late = (prio == 0).then(|| Tick::from_seconds_f64(SCRUB_KEEP_S));
+        self.request_job(key, time, scale, project, prio, false, late);
     }
 
-    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool) {
+    fn request_job(&self, key: FrameKey, time: Tick, scale: f32, project: &Arc<Project>, prio: u32, prefetch: bool, catch_up: Option<Tick>) {
+        let hit = || self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).request_hits += 1;
         if self.shared.done.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
             || self.shared.plans.lock().unwrap_or_else(|e| e.into_inner()).map.contains_key(&key)
         {
+            hit();
             return;
         }
         if self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(k, c, _)| *k == key && !c.load(Ordering::Relaxed)) {
+            hit();
             return;
         }
         let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(j) = q.iter_mut().find(|j| j.key == key) {
             j.prio = j.prio.min(prio);
             j.prefetch &= prefetch;
+            // the playhead only moves on: the newest (smallest) margin
+            j.catch_up = match (j.catch_up, catch_up) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            drop(q);
+            hit();
             return;
         }
+        self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()).request_misses += 1;
         if prio == 0 {
             // A new frame on screen for this view replaces the one asked for before: scrubbing
             // asks for one per refresh, and without this the oldest position would decode
@@ -426,7 +520,7 @@ impl FrameServer {
                 }
             }
         }
-        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, time, scale, project: project.clone(), prio });
+        q.push_back(Job { key, queued: Instant::now(), cancel: Default::default(), prefetch, catch_up, time, scale, project: project.clone(), prio });
         drop(q);
         self.shared.cv.notify_one();
     }
@@ -444,13 +538,16 @@ impl FrameServer {
         let fps = rate.as_f64() * speed.abs().max(1.0) / step as f64;
         let (lead, stride) = if preroll { (1, 1) } else { playback_plan(self.render_cost(), fps, self.shared.workers) };
         if lead <= 1 {
-            self.request(key, rate.tick_of(key.frame), scale, project, 0);
+            // the frame due now; once the clock runs, the frames before it are late
+            self.request_job(key, rate.tick_of(key.frame), scale, project, 0, false, (!preroll && dir > 0).then_some(Tick::ZERO));
         }
         let ahead = prefetch_depth(speed);
         for i in 0..ahead {
             let f = key.frame + (lead + i * stride) * dir * step;
             if f >= 0 {
-                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true);
+                // forward play: frames before the playhead are late (reverse play skips nothing)
+                let late = (!preroll && dir > 0).then(|| rate.tick_of(f) - rate.tick_of(key.frame));
+                self.request_job(FrameKey { frame: f, ..key }, rate.tick_of(f), scale, project, i as u32 + 1, true, late);
             }
         }
         let (target, rev, cur) = (key.target, key.revision, key.frame);
@@ -658,23 +755,25 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
     let _ = filmcraft_media::pending::take();
     let mut loading = false;
     let preview = filmcraft_media::cancel::with_cancel(&job.cancel, || {
-        if let Target::SequencePlan(seq) = job.key.target {
-            let (plan, pv) = plan_job(job, seq, pool, services, previews);
-            loading = filmcraft_media::pending::take();
-            if !job.cancel.load(Ordering::Relaxed) && !loading {
-                // Convert texels for upload here, not on the UI thread when the frame is shown.
-                let prepared = filmcraft_gpu::prepare(&plan);
-                sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared });
+        filmcraft_media::cancel::with_catch_up(job.catch_up, || {
+            if let Target::SequencePlan(seq) = job.key.target {
+                let (plan, pv) = plan_job(job, seq, pool, services, previews);
+                loading = filmcraft_media::pending::take();
+                if !job.cancel.load(Ordering::Relaxed) && !loading {
+                    // Convert texels for upload here, not on the UI thread when the frame is shown.
+                    let prepared = filmcraft_gpu::prepare(&plan);
+                    sh.plans.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, GpuPlan { plan, prepared });
+                }
+                pv
+            } else {
+                let (img, pv) = render_job(job, pool, services, previews);
+                loading = filmcraft_media::pending::take();
+                if !job.cancel.load(Ordering::Relaxed) && !loading {
+                    sh.done.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, Arc::new(img));
+                }
+                pv
             }
-            pv
-        } else {
-            let (img, pv) = render_job(job, pool, services, previews);
-            loading = filmcraft_media::pending::take();
-            if !job.cancel.load(Ordering::Relaxed) && !loading {
-                sh.done.lock().unwrap_or_else(|e| e.into_inner()).insert(job.key, Arc::new(img));
-            }
-            pv
-        }
+        })
     });
     let cancelled = job.cancel.load(Ordering::Relaxed);
     sh.in_flight.lock().unwrap_or_else(|e| e.into_inner()).retain(|(k, c, _)| !(*k == job.key && Arc::ptr_eq(c, &job.cancel)));
@@ -687,6 +786,23 @@ fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Ser
         if !cancelled || cost > *c {
             *c = if *c == 0.0 { cost } else { *c * 0.8 + cost * 0.2 };
         }
+    }
+    {
+        let job_wall = started.elapsed();
+        let source = SOURCE_TIME.with(|s| s.get()).0;
+        let (src_ms, render_ms) = (source.as_secs_f64() * 1e3, job_wall.saturating_sub(source).as_secs_f64() * 1e3);
+        let mut st = sh.stats.lock().unwrap_or_else(|e| e.into_inner());
+        st.jobs += 1;
+        st.cancelled += cancelled as u64;
+        st.preview += preview as u64;
+        st.prefetch += job.prefetch as u64;
+        st.source_ms += src_ms;
+        st.render_ms += render_ms;
+        st.job_ms += job_wall.as_secs_f64() * 1e3;
+        if st.recent.len() >= FrameStats::RECENT {
+            st.recent.pop_front();
+        }
+        st.recent.push_back((src_ms as f32, render_ms as f32));
     }
     if profiling {
         let (source_wall, source_cpu) = SOURCE_TIME.with(|s| s.get());

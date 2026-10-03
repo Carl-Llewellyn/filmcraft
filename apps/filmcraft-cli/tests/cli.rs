@@ -90,3 +90,68 @@ fn export_wav_waits_for_job() {
     assert!(std::fs::metadata(&out).map(|m| m.len() > 44).unwrap_or(false));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `export --preset`: a built-in preset by name (dash or en dash), a custom range, a user preset
+/// from `--data-dir`, `--list-presets`, `--queue`, and a clean failure for an unknown preset.
+#[test]
+fn export_with_presets() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/export-tests").join(format!("cli-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = dir.join("data");
+    let data_s = data.to_str().unwrap();
+    let out = dir.join("proxy.mov");
+    let o = cli(&["--demo", "--data-dir", data_s, "export", out.to_str().unwrap(), "--preset", "Apple ProRes 422 Proxy", "--start", "0", "--end", "0.25"]);
+    let v = json_out(&o);
+    assert_eq!(v["preset"], "Apple ProRes 422 Proxy");
+    assert!(std::fs::metadata(&out).map(|m| m.len() > 1000).unwrap_or(false));
+    if let Some(ffprobe) = ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"].into_iter().find(|p| std::path::Path::new(p).exists()) {
+        let p = Command::new(ffprobe)
+            .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name,profile,width", "-of", "csv=p=0", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&p.stdout).trim(), "prores,Proxy,1920");
+    }
+    // the extension comes from the preset; a hyphen finds the en-dash name
+    let base = dir.join("adaptive");
+    json_out(&cli(&[
+        "--demo",
+        "--data-dir",
+        data_s,
+        "export",
+        base.to_str().unwrap(),
+        "--preset",
+        "Match Source - Adaptive Low Bitrate",
+        "--start",
+        "0",
+        "--end",
+        "0.2",
+    ]));
+    assert!(dir.join("adaptive.mp4").exists());
+    // a user preset saved into the data directory is found by later runs
+    json_out(&cli(&[
+        "--data-dir",
+        data_s,
+        "exec",
+        "export.presets.save",
+        "name=Tiny WAV",
+        "from=Waveform Audio 48 kHz 16-bit",
+        "settings={\"audio\":{\"channels\":1}}",
+    ]));
+    let list = json_out(&cli(&["--data-dir", data_s, "export", "--list-presets", "tiny"]));
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    let wav = dir.join("tiny.wav");
+    json_out(&cli(&["--demo", "--data-dir", data_s, "export", wav.to_str().unwrap(), "--preset", "Tiny WAV", "--start", "0", "--end", "0.5"]));
+    let b = std::fs::read(&wav).unwrap();
+    assert_eq!(u16::from_le_bytes([b[22], b[23]]), 1, "mono from the user preset");
+    // through the queue
+    let q = dir.join("queued.wav");
+    let v = json_out(&cli(&["--demo", "--data-dir", data_s, "export", q.to_str().unwrap(), "--preset", "Tiny WAV", "--queue", "--range", "entire"]));
+    assert_eq!(v["items"][0]["status"], "done", "{v}");
+    assert!(q.exists());
+    // unknown preset: exit status 1 and a message naming it
+    let bad = cli(&["--demo", "--data-dir", data_s, "export", dir.join("x.mp4").to_str().unwrap(), "--preset", "No Such Preset"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("No Such Preset"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

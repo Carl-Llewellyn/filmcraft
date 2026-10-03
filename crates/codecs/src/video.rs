@@ -31,6 +31,93 @@ pub trait VideoDecoder: Send {
     fn is_random_access(&self, _sample: &[u8]) -> Option<bool> {
         None
     }
+    /// Whether `sample` can be left out without changing any other picture: a non-reference
+    /// picture. Decoding forward to a frame while catching up skips such samples when their
+    /// frames are late ([`filmcraft_media::cancel::catch_up`]). False when unknown.
+    fn is_disposable(&self, _sample: &[u8]) -> bool {
+        false
+    }
+}
+
+/// NAL unit headers of a length-prefixed (avcC / hvcC) sample: the first two bytes of each unit.
+fn nal_headers(sample: &[u8], length_size: usize) -> impl Iterator<Item = (u8, u8)> + '_ {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        if length_size == 0 || length_size > 4 || pos + length_size > sample.len() {
+            return None;
+        }
+        let len = sample[pos..pos + length_size].iter().fold(0usize, |a, &b| (a << 8) | b as usize);
+        pos += length_size;
+        if len == 0 || pos + len > sample.len() {
+            return None;
+        }
+        let h = (sample[pos], if len > 1 { sample[pos + 1] } else { 0 });
+        pos += len;
+        Some(h)
+    })
+}
+
+/// H.264 (7.4.1): every coded slice (NAL types 1-5) of the access unit has nal_ref_idc 0.
+pub fn h264_disposable(sample: &[u8], length_size: usize) -> bool {
+    let mut slices = 0;
+    for (h, _) in nal_headers(sample, length_size) {
+        if (1..=5).contains(&(h & 0x1f)) {
+            if h & 0x60 != 0 {
+                return false;
+            }
+            slices += 1;
+        }
+    }
+    slices > 0
+}
+
+/// [`h264_disposable`] for an Annex B (start-code) sample.
+pub fn h264_disposable_annexb(sample: &[u8]) -> bool {
+    let mut slices = 0;
+    for n in filmcraft_bitstream::annexb_nals(sample) {
+        let Some(&h) = n.first() else { continue };
+        if (1..=5).contains(&(h & 0x1f)) {
+            if h & 0x60 != 0 {
+                return false;
+            }
+            slices += 1;
+        }
+    }
+    slices > 0
+}
+
+/// HEVC (7.4.2.2): every VCL NAL unit is a sub-layer non-reference picture (TRAIL_N, TSA_N,
+/// STSA_N, RADL_N, RASL_N, RSV_VCL_N10/12/14) of the highest temporal sub-layer, so no picture
+/// references it. `highest_tid` = numTemporalLayers - 1 from the hvcC (None: unknown).
+pub fn hevc_disposable(sample: &[u8], length_size: usize, highest_tid: Option<u8>) -> bool {
+    let Some(top) = highest_tid else { return false };
+    let mut slices = 0;
+    for (h0, h1) in nal_headers(sample, length_size) {
+        let t = (h0 >> 1) & 0x3f;
+        if t < 32 {
+            let tid = (h1 & 7).saturating_sub(1);
+            if t > 14 || t % 2 == 1 || tid != top {
+                return false;
+            }
+            slices += 1;
+        }
+    }
+    slices > 0
+}
+
+/// A plane as a tight `w`×`h` buffer. Decoders hand over owned planes that usually are tight
+/// already: those are moved, not copied (a 2160p 4:2:0 picture is 12 MB per copy).
+pub(crate) fn tight_plane<T: Copy>(src: Vec<T>, stride: usize, w: usize, h: usize) -> Vec<T> {
+    if stride == w && src.len() >= w * h {
+        let mut v = src;
+        v.truncate(w * h);
+        return v;
+    }
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        out.extend_from_slice(&src[y * stride..y * stride + w]);
+    }
+    out
 }
 
 /// A factory returns `None` when it does not handle the entry.
@@ -67,30 +154,26 @@ pub fn mjpeg_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 pub struct H264Decoder {
     avcc: Vec<u8>,
     dec: filmcraft_h264::Decoder,
+    length_size: usize,
 }
 
 impl H264Decoder {
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
         let dec = filmcraft_h264::Decoder::from_avcc(&avcc).map_err(|e| CodecError::Decode(e.to_string()))?;
-        Ok(Self { avcc, dec })
+        let length_size = avcc.get(4).map_or(4, |b| (b & 3) as usize + 1);
+        Ok(Self { avcc, dec, length_size })
+    }
+    /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
+    pub fn annexb() -> Self {
+        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::new(), length_size: 0 }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
         use std::sync::Arc;
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
-        let tight = |src: &[u8], stride: usize, w: usize, h: usize| -> Vec<u8> {
-            if stride == w && src.len() >= w * h {
-                return src[..w * h].to_vec();
-            }
-            let mut out = Vec::with_capacity(w * h);
-            for y in 0..h {
-                out.extend_from_slice(&src[y * stride..y * stride + w]);
-            }
-            out
-        };
-        let y = tight(&p.y, p.y_stride, w, h);
-        let u = tight(&p.u, p.uv_stride, cw, ch);
-        let v = tight(&p.v, p.uv_stride, cw, ch);
+        let y = tight_plane(p.y, p.y_stride, w, h);
+        let u = tight_plane(p.u, p.uv_stride, cw, ch);
+        let v = tight_plane(p.v, p.uv_stride, cw, ch);
         let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
         if let Some(m) = filmcraft_color::Matrix::from_code(p.color.matrix) {
             color.matrix = m;
@@ -123,12 +206,24 @@ impl VideoDecoder for H264Decoder {
         self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
-        if let Ok(d) = filmcraft_h264::Decoder::from_avcc(&self.avcc) {
+        if self.avcc.is_empty() {
+            self.dec = filmcraft_h264::Decoder::new();
+        } else if let Ok(d) = filmcraft_h264::Decoder::from_avcc(&self.avcc) {
             self.dec = d;
         }
     }
     fn name(&self) -> &str {
         "FilmCraft H.264"
+    }
+    fn is_disposable(&self, sample: &[u8]) -> bool {
+        if self.length_size == 0 {
+            return h264_disposable_annexb(sample);
+        }
+        h264_disposable(sample, self.length_size)
+    }
+    fn is_random_access(&self, sample: &[u8]) -> Option<bool> {
+        // Annex B samples carry their parameter sets: an IDR access unit is a starting point.
+        (self.length_size == 0).then(|| filmcraft_bitstream::annexb_nals(sample).iter().any(|n| n.first().is_some_and(|h| h & 0x1f == 5)))
     }
 }
 
@@ -143,47 +238,42 @@ pub fn h264_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
 pub struct HevcDecoder {
     hvcc: Vec<u8>,
     dec: filmcraft_hevc::Decoder,
+    length_size: usize,
+    highest_tid: Option<u8>,
 }
 
 impl HevcDecoder {
     pub fn new(hvcc: Vec<u8>) -> Result<Self> {
         let dec = filmcraft_hevc::Decoder::from_hvcc(&hvcc).map_err(|e| CodecError::Decode(e.to_string()))?;
-        Ok(Self { hvcc, dec })
+        // hvcC byte 21: constantFrameRate(2) numTemporalLayers(3) temporalIdNested(1) lengthSizeMinusOne(2)
+        let length_size = hvcc.get(21).map_or(4, |b| (b & 3) as usize + 1);
+        let highest_tid = hvcc.get(21).map(|b| (b >> 3) & 7).filter(|&n| n > 0).map(|n| n - 1);
+        Ok(Self { hvcc, dec, length_size, highest_tid })
     }
     fn convert(p: filmcraft_hevc::Picture) -> DecodedFrame {
         use filmcraft_hevc::Plane;
         use std::sync::Arc;
-        fn tight<T: Copy>(src: &[T], stride: usize, w: usize, h: usize) -> Vec<T> {
-            if stride == w && src.len() >= w * h {
-                return src[..w * h].to_vec();
-            }
-            let mut out = Vec::with_capacity(w * h);
-            for y in 0..h {
-                out.extend_from_slice(&src[y * stride..y * stride + w]);
-            }
-            out
-        }
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
-        let data = match (&p.y, &p.u, &p.v) {
+        let (ys, uvs) = (p.y_stride, p.uv_stride);
+        let wide = |pl: Plane| -> Vec<u16> {
+            match pl {
+                Plane::U16(v) => v,
+                Plane::U8(v) => v.into_iter().map(u16::from).collect(),
+            }
+        };
+        let data = match (p.y, p.u, p.v) {
             (Plane::U8(y), Plane::U8(u), Plane::U8(v)) => filmcraft_frame::PixelData::Yuv8 {
-                planes: [Arc::new(tight(y, p.y_stride, w, h)), Arc::new(tight(u, p.uv_stride, cw, ch)), Arc::new(tight(v, p.uv_stride, cw, ch))],
+                planes: [Arc::new(tight_plane(y, ys, w, h)), Arc::new(tight_plane(u, uvs, cw, ch)), Arc::new(tight_plane(v, uvs, cw, ch))],
                 chroma: filmcraft_frame::Chroma::C420,
                 alpha: None,
             },
-            _ => {
-                let wide = |pl: &Plane| -> Vec<u16> { (0..pl.len()).map(|i| pl.get(i)).collect() };
-                filmcraft_frame::PixelData::Yuv16 {
-                    planes: [
-                        Arc::new(tight(&wide(&p.y), p.y_stride, w, h)),
-                        Arc::new(tight(&wide(&p.u), p.uv_stride, cw, ch)),
-                        Arc::new(tight(&wide(&p.v), p.uv_stride, cw, ch)),
-                    ],
-                    chroma: filmcraft_frame::Chroma::C420,
-                    bits: p.bit_depth,
-                    alpha: None,
-                }
-            }
+            (y, u, v) => filmcraft_frame::PixelData::Yuv16 {
+                planes: [Arc::new(tight_plane(wide(y), ys, w, h)), Arc::new(tight_plane(wide(u), uvs, cw, ch)), Arc::new(tight_plane(wide(v), uvs, cw, ch))],
+                chroma: filmcraft_frame::Chroma::C420,
+                bits: p.bit_depth,
+                alpha: None,
+            },
         };
         let mut color = filmcraft_color::ColorInfo { matrix: filmcraft_frame::default_matrix(p.width, p.height), ..filmcraft_color::ColorInfo::REC709 };
         if let Some(m) = filmcraft_color::Matrix::from_code(p.color.matrix) {
@@ -216,6 +306,9 @@ impl VideoDecoder for HevcDecoder {
     }
     fn name(&self) -> &str {
         "FilmCraft HEVC"
+    }
+    fn is_disposable(&self, sample: &[u8]) -> bool {
+        hevc_disposable(sample, self.length_size, self.highest_tid)
     }
 }
 
@@ -304,9 +397,10 @@ impl Vp9Decoder {
             (false, false) => (Chroma::C444, false),
             (false, true) => (Chroma::C444, true),
         };
-        fn expand<T: Copy>(v: &[T], cw: usize, ch: usize, h: usize, rows_440: bool) -> Vec<T> {
+        // planes are moved (tight already), not copied
+        fn expand<T: Copy>(v: Vec<T>, cw: usize, ch: usize, h: usize, rows_440: bool) -> Vec<T> {
             if !rows_440 {
-                return v[..cw * ch].to_vec();
+                return tight_plane(v, cw, cw, ch);
             }
             let mut out = Vec::with_capacity(cw * h);
             for y in 0..h {
@@ -314,14 +408,14 @@ impl Vp9Decoder {
             }
             out
         }
-        let data = match (&p.y, &p.u, &p.v) {
+        let data = match (p.y, p.u, p.v) {
             (Plane::U8(y), Plane::U8(u), Plane::U8(v)) => PixelData::Yuv8 {
-                planes: [Arc::new(y[..w * h].to_vec()), Arc::new(expand(u, cw, ch, h, rows_440)), Arc::new(expand(v, cw, ch, h, rows_440))],
+                planes: [Arc::new(tight_plane(y, w, w, h)), Arc::new(expand(u, cw, ch, h, rows_440)), Arc::new(expand(v, cw, ch, h, rows_440))],
                 chroma,
                 alpha: None,
             },
             (Plane::U16(y), Plane::U16(u), Plane::U16(v)) => PixelData::Yuv16 {
-                planes: [Arc::new(y[..w * h].to_vec()), Arc::new(expand(u, cw, ch, h, rows_440)), Arc::new(expand(v, cw, ch, h, rows_440))],
+                planes: [Arc::new(tight_plane(y, w, w, h)), Arc::new(expand(u, cw, ch, h, rows_440)), Arc::new(expand(v, cw, ch, h, rows_440))],
                 chroma,
                 bits: p.bit_depth,
                 alpha: None,
@@ -585,4 +679,48 @@ impl VideoDecoder for DnxDecoder {
 
 pub fn dnx_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     matches!(e.codec, CodecConfig::Dnx { .. }).then(|| Ok(Box::new(DnxDecoder) as Box<dyn VideoDecoder>))
+}
+
+#[cfg(test)]
+mod disposable_tests {
+    use super::{h264_disposable, hevc_disposable};
+
+    /// A 4-byte length-prefixed sample of the given NAL units.
+    fn sample(nals: &[&[u8]]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for n in nals {
+            v.extend_from_slice(&(n.len() as u32).to_be_bytes());
+            v.extend_from_slice(n);
+        }
+        v
+    }
+
+    #[test]
+    fn h264_non_reference_access_units() {
+        // nal_ref_idc 0 slice (type 1), with an SEI (type 6) before it
+        assert!(h264_disposable(&sample(&[&[0x06, 5, 1], &[0x01, 0x9a, 0]]), 4));
+        // reference P slice (nal_ref_idc 2), IDR, mixed reference / non-reference slices
+        assert!(!h264_disposable(&sample(&[&[0x41, 0x9a]]), 4));
+        assert!(!h264_disposable(&sample(&[&[0x65, 0x88]]), 4));
+        assert!(!h264_disposable(&sample(&[&[0x01, 0x9a], &[0x21, 0x9a]]), 4));
+        // no slice at all, truncated data
+        assert!(!h264_disposable(&sample(&[&[0x06, 5]]), 4));
+        assert!(!h264_disposable(&[0, 0, 0, 9, 1], 4));
+    }
+
+    #[test]
+    fn hevc_sub_layer_non_reference_pictures_of_the_top_layer() {
+        let nal = |t: u8, tid1: u8| [t << 1, tid1, 0xaf];
+        // TRAIL_N (0) at TemporalId 0 with one temporal layer
+        assert!(hevc_disposable(&sample(&[&nal(39, 1), &nal(0, 1)]), 4, Some(0)));
+        // TRAIL_R (1), CRA (21), IDR (19) are referenced
+        for t in [1u8, 19, 21] {
+            assert!(!hevc_disposable(&sample(&[&nal(t, 1)]), 4, Some(0)), "type {t}");
+        }
+        // RASL_N (8) at the top layer of two; at a lower layer it may be referenced
+        assert!(hevc_disposable(&sample(&[&nal(8, 2)]), 4, Some(1)));
+        assert!(!hevc_disposable(&sample(&[&nal(0, 1)]), 4, Some(1)));
+        // unknown layering: never
+        assert!(!hevc_disposable(&sample(&[&nal(0, 1)]), 4, None));
+    }
 }

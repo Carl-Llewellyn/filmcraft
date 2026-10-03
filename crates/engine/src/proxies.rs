@@ -274,7 +274,7 @@ pub fn poll(s: &mut Session) {
             OnDone::Nothing => Ok(()),
         };
         if let Err(e) = r {
-            s.events.push(crate::Event::Toast { message: e.to_string(), error: true });
+            s.error_toast("job", e.to_string());
         }
     }
 }

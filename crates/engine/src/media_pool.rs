@@ -63,6 +63,56 @@ pub fn media_key(m: &MediaClip) -> String {
     }
 }
 
+/// Open the image sequence that `first` (a numbered still) starts: its frames from that number to
+/// the highest present one, played at `rate`. Frames are listed with [`Services::list_dir`], or
+/// found by probing consecutive numbers (stopping after 100 missing in a row) when the host cannot
+/// list directories.
+pub fn open_image_sequence(first: &str, services: &dyn Services, rate: filmcraft_time::FrameRate, name: &str) -> Result<SharedSource, MediaError> {
+    let frames = image_sequence_frames(first, services)?;
+    let loader = match services.file_loader() {
+        Some(l) => l,
+        None => {
+            // no lasting file access: read the (encoded) frames now
+            let mut files = HashMap::new();
+            for p in frames.iter().flatten() {
+                if let Ok(b) = services.read_file(p) {
+                    files.insert(p.clone(), Arc::<[u8]>::from(b));
+                }
+            }
+            Arc::new(move |p: &str| files.get(p).map(|b| b.to_vec()).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, p.to_string())))
+        }
+    };
+    Ok(Arc::new(filmcraft_media::sequence::ImageSequenceSource::new(name, frames, rate, loader)?))
+}
+
+/// The frames of the image sequence starting at `first` (see [`open_image_sequence`]).
+pub fn image_sequence_frames(first: &str, services: &dyn Services) -> Result<Vec<Option<String>>, MediaError> {
+    use filmcraft_media::sequence::{Numbered, sequence_frames};
+    let n = Numbered::parse(first).ok_or_else(|| MediaError::Unsupported(format!("{first}: not a numbered still image")))?;
+    let io = |e: std::io::Error| {
+        if e.kind() == std::io::ErrorKind::NotFound { MediaError::Offline(format!("{first}: {e}")) } else { MediaError::Io(format!("{first}: {e}")) }
+    };
+    services.file_size(first).map_err(io)?;
+    match services.list_dir(n.dir.trim_end_matches(['/', '\\'])) {
+        Some(list) => Ok(sequence_frames(&n, &list.map_err(io)?)),
+        None => {
+            let mut names = vec![n.file_name(n.number)];
+            let mut misses = 0;
+            let mut k = n.number + 1;
+            while misses < 100 && names.len() < 1_000_000 {
+                if services.file_size(&n.path(k)).is_ok() {
+                    names.push(n.file_name(k));
+                    misses = 0;
+                } else {
+                    misses += 1;
+                }
+                k += 1;
+            }
+            Ok(sequence_frames(&n, &names))
+        }
+    }
+}
+
 fn file_name(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
@@ -98,6 +148,11 @@ impl MediaPool {
 
     pub fn cached(&self, item: ItemId) -> Option<SharedSource> {
         self.sources.read().unwrap_or_else(|e| e.into_inner()).get(&item).map(|(_, s)| s.clone())
+    }
+
+    /// Sources opened so far (originals and proxies; `perf.stats`).
+    pub fn open_sources(&self) -> usize {
+        self.sources.read().unwrap_or_else(|e| e.into_inner()).len() + self.proxies.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     pub fn use_proxies(&self) -> bool {
@@ -171,7 +226,11 @@ impl MediaPool {
                 self.set_offline(item, OfflineReason::MadeOffline, path, "made offline");
                 Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::MadeOffline))
             }
-            MediaRef::File { path } => match self.open_file(path, services) {
+            MediaRef::File { path } => match if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
+                open_image_sequence(path, services, m.info.frame_rate(), &it.name)
+            } else {
+                self.open_file(path, services)
+            } {
                 Ok(s) => {
                     self.offline.write().unwrap_or_else(|e| e.into_inner()).remove(&item);
                     s

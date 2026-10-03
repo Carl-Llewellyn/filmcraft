@@ -99,6 +99,7 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
         },
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_items(app)).unwrap_or_default()),
         "ui.inspect" => ok(inspect(app, ctx)),
+        "perf.stats" => ok(crate::perf::stats(app)),
         "ui.elements" => {
             let prefix = s("prefix").unwrap_or("");
             ok(serde_json::to_value(app.auto.query(prefix)).unwrap_or_default())
@@ -180,6 +181,31 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
                 match serde_json::from_value(cur) {
                     Ok(m) => *mv = m,
                     Err(e) => return err(format!("`{k}`: {e}")),
+                }
+            }
+            // Export mode state (`panels::export_mode::ExportUi`), deep-merged; `"preset": name`
+            // applies that preset's settings first
+            if let Some(patch) = p.get("export").filter(|v| v.is_object()) {
+                if let Some(name) = patch.get("preset").and_then(Value::as_str)
+                    && name != crate::panels::export_mode::CUSTOM
+                    && !crate::panels::export_mode::apply_preset(app, name)
+                {
+                    return err(format!("no export preset named `{name}`"));
+                }
+                let mut cur = serde_json::to_value(&app.ui.export).unwrap_or_default();
+                merge(&mut cur, patch);
+                match serde_json::from_value(cur) {
+                    Ok(e) => app.ui.export = e,
+                    Err(e) => return err(format!("`export`: {e}")),
+                }
+            }
+            // panel settings (`panels::panel_state`): {"scopes": {...}, "timecode": {...}, …}, merged
+            if let Some(patch) = p.get("panels") {
+                let mut cur = serde_json::to_value(&app.ui.panels).unwrap_or_default();
+                merge(&mut cur, patch);
+                match serde_json::from_value(cur) {
+                    Ok(v) => app.ui.panels = v,
+                    Err(e) => return err(format!("`panels`: {e}")),
                 }
             }
             // fields of the open Edit / Clip / File dialog (`panels::clip_dialogs`)
@@ -329,6 +355,23 @@ pub fn handle(app: &mut FilmcraftApp, ctx: &egui::Context, req: &ControlRequest)
             ok(Value::Null)
         }
         m => err(format!("unknown method `{m}`")),
+    }
+}
+
+/// Merge `patch` into `v` (objects recursively; other values replace).
+fn merge(v: &mut Value, patch: &Value) {
+    match (v, patch) {
+        (Value::Object(o), Value::Object(p)) => {
+            for (k, pv) in p {
+                match o.get_mut(k) {
+                    Some(cur) => merge(cur, pv),
+                    None => {
+                        o.insert(k.clone(), pv.clone());
+                    }
+                }
+            }
+        }
+        (v, p) => *v = p.clone(),
     }
 }
 

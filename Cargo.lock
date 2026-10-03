@@ -1794,6 +1794,8 @@ dependencies = [
  "filmcraft-codecs",
  "filmcraft-engine",
  "filmcraft-media",
+ "filmcraft-mxf",
+ "filmcraft-ogg",
  "filmcraft-time",
  "serde_json",
  "tokio",
@@ -1814,14 +1816,18 @@ dependencies = [
  "filmcraft-isobmff",
  "filmcraft-matroska",
  "filmcraft-media",
+ "filmcraft-mxf",
+ "filmcraft-ogg",
  "filmcraft-opus",
  "filmcraft-prores",
+ "filmcraft-testkit",
  "filmcraft-time",
  "filmcraft-vp9",
  "image",
  "log",
  "symphonia",
  "thiserror 2.0.21",
+ "web-time",
 ]
 
 [[package]]
@@ -1871,6 +1877,7 @@ dependencies = [
  "filmcraft-media",
  "filmcraft-project",
  "filmcraft-render",
+ "filmcraft-scopes",
  "filmcraft-speech",
  "filmcraft-testkit",
  "filmcraft-text",
@@ -1888,11 +1895,13 @@ name = "filmcraft-export"
 version = "0.1.0"
 dependencies = [
  "filmcraft-aac",
+ "filmcraft-audio-dsp",
  "filmcraft-bitstream",
  "filmcraft-codecs",
  "filmcraft-color",
  "filmcraft-dnx",
  "filmcraft-frame",
+ "filmcraft-geom",
  "filmcraft-h264enc",
  "filmcraft-isobmff",
  "filmcraft-media",
@@ -1900,6 +1909,7 @@ dependencies = [
  "filmcraft-prores",
  "filmcraft-render",
  "filmcraft-testkit",
+ "filmcraft-text",
  "filmcraft-time",
  "image",
  "rayon",
@@ -2053,6 +2063,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "filmcraft-mxf"
+version = "0.1.0"
+dependencies = [
+ "filmcraft-testkit",
+]
+
+[[package]]
+name = "filmcraft-ogg"
+version = "0.1.0"
+dependencies = [
+ "filmcraft-testkit",
+]
+
+[[package]]
 name = "filmcraft-opus"
 version = "0.1.0"
 dependencies = [
@@ -2099,6 +2123,15 @@ dependencies = [
  "image",
  "rayon",
  "rustix 1.1.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "filmcraft-scopes"
+version = "0.1.0"
+dependencies = [
+ "filmcraft-color",
  "serde",
  "serde_json",
 ]
@@ -2165,6 +2198,7 @@ dependencies = [
  "filmcraft-media",
  "filmcraft-project",
  "filmcraft-render",
+ "filmcraft-scopes",
  "filmcraft-text",
  "filmcraft-time",
  "image",

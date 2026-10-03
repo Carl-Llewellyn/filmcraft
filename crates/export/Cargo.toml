@@ -17,6 +17,9 @@ filmcraft-bitstream = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-project = { workspace = true }
 filmcraft-render = { workspace = true }
+filmcraft-audio-dsp = { workspace = true }
+filmcraft-geom = { workspace = true }
+filmcraft-text = { workspace = true }
 filmcraft-isobmff = { workspace = true }
 filmcraft-prores = { workspace = true }
 filmcraft-dnx = { workspace = true }
@@ -27,7 +30,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 rayon = { workspace = true }
 web-time = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "tiff", "bmp"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 shiguredo_nvcodec = "=2026.2.0"

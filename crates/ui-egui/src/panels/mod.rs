@@ -8,6 +8,7 @@ pub mod dialogs;
 pub mod effect_controls;
 pub mod effects;
 pub mod essential_sound;
+pub mod events;
 pub mod export_mode;
 pub mod file_dialogs;
 pub mod graphics;
@@ -16,17 +17,22 @@ pub mod lumetri;
 pub mod masks;
 pub mod media_dialogs;
 pub mod menu_dialogs;
+pub mod metadata;
 pub mod meters;
 pub mod misc;
 pub mod mixer;
 pub mod monitor;
 pub mod monitor_view;
 pub mod multicam;
+pub mod panel_state;
 pub mod presets;
 pub mod project;
+pub mod reference;
+pub mod scopes;
 pub mod settings;
 pub mod shortcuts_dialog;
 pub mod text;
+pub mod timecode;
 pub mod timeline;
 pub mod timeline_automation;
 pub mod timeline_captions;
@@ -61,7 +67,12 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, p: PanelKind, rect: Rect)
         PanelKind::MediaBrowser => misc::media_browser(app, ui, rect),
         PanelKind::AudioTrackMixer => mixer::track_mixer(app, ui, rect),
         PanelKind::AudioClipMixer => mixer::clip_mixer(app, ui, rect),
-        PanelKind::LumetriScopes => misc::scopes(app, ui, rect),
+        PanelKind::LumetriScopes => scopes::show(app, ui, rect),
+        PanelKind::Metadata => metadata::show(app, ui, rect),
+        PanelKind::Timecode => timecode::show(app, ui, rect),
+        PanelKind::Events => events::events(app, ui, rect),
+        PanelKind::Progress => events::progress(app, ui, rect),
+        PanelKind::ReferenceMonitor => reference::show(app, ui, rect),
         PanelKind::Text => text::show(app, ui, rect),
         PanelKind::EssentialSound => essential_sound::show(app, ui, rect),
         other => crate::dock::placeholder(ui, rect, &app.tokens, &format!("{} — coming in a later milestone", other.title())),

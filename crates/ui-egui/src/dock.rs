@@ -32,10 +32,14 @@ pub enum PanelKind {
     EssentialSound,
     Properties,
     Text,
+    Events,
+    Progress,
+    ReferenceMonitor,
+    Timecode,
 }
 
 impl PanelKind {
-    pub const ALL: [PanelKind; 22] = [
+    pub const ALL: [PanelKind; 26] = [
         PanelKind::Project,
         PanelKind::MediaBrowser,
         PanelKind::Libraries,
@@ -58,6 +62,10 @@ impl PanelKind {
         PanelKind::EssentialSound,
         PanelKind::Properties,
         PanelKind::Text,
+        PanelKind::Events,
+        PanelKind::Progress,
+        PanelKind::ReferenceMonitor,
+        PanelKind::Timecode,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -83,6 +91,10 @@ impl PanelKind {
             PanelKind::EssentialSound => "Essential Sound",
             PanelKind::Properties => "Properties",
             PanelKind::Text => "Text",
+            PanelKind::Events => "Events",
+            PanelKind::Progress => "Progress",
+            PanelKind::ReferenceMonitor => "Reference Monitor",
+            PanelKind::Timecode => "Timecode",
         }
     }
     pub fn id(self) -> String {

@@ -39,6 +39,9 @@ pub struct TlState {
     snap_x: Option<f32>,
     pub peaks: Arc<Mutex<HashMap<ItemId, Arc<Vec<(f32, f32)>>>>>,
     peaks_pending: Arc<Mutex<Vec<ItemId>>>,
+    /// Source peak of each cached peak list (keyed by the list's address), for the waveform
+    /// display gain: scanning the whole source per clip per frame cost more than drawing.
+    peak_max: HashMap<ItemId, (usize, f32)>,
     zoom_anchor: Option<(f64, f32)>,
 }
 
@@ -49,6 +52,7 @@ impl TlState {
     pub fn reset_media_caches(&mut self) {
         self.peaks = Default::default();
         self.peaks_pending = Default::default();
+        self.peak_max.clear();
     }
 }
 
@@ -559,7 +563,15 @@ fn draw_waveform(app: &mut FilmcraftApp, p: &egui::Painter, body: Rect, it: &Tra
     if clip.width() <= 0.0 {
         return;
     }
-    let peak = peaks.iter().fold(0f32, |m, (a, b)| m.max(a.abs()).max(b.abs()));
+    let key = Arc::as_ptr(&peaks) as usize;
+    let peak = match app.tl.peak_max.get(&it.item) {
+        Some(&(k, v)) if k == key => v,
+        _ => {
+            let v = peaks.iter().fold(0f32, |m, (a, b)| m.max(a.abs()).max(b.abs()));
+            app.tl.peak_max.insert(it.item, (key, v));
+            v
+        }
+    };
     let gain = waveform_display_gain(peak, it.gain_db);
     let dynamic = app.ui.extras.dynamic_waveforms;
     let mut mesh = egui::Mesh::default();

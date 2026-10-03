@@ -1,5 +1,6 @@
-//! Minimal WAV (RIFF/RF64 PCM 8/16/24/32-bit int, 32/64-bit float) source. The full `riff` crate
-//! (BWF metadata, AIFF) will replace this.
+//! Minimal WAV (RIFF/RF64 PCM 8/16/24/32-bit int, 32/64-bit float) source, with the Broadcast Wave
+//! start time: `bext` TimeReference (EBU Tech 3285), else iXML `BWF_TIME_REFERENCE_LOW/HIGH`. The
+//! full `riff` crate (all BWF metadata, AIFF) will replace this.
 
 use std::sync::Arc;
 
@@ -21,6 +22,7 @@ pub struct WavSource {
     bits: u16,
     float: bool,
     rate: u32,
+    time_reference: Option<u64>,
 }
 
 fn le16(b: &[u8], o: usize) -> u16 {
@@ -36,6 +38,8 @@ impl WavSource {
         let mut pos = 12;
         let mut fmt = None;
         let mut data = None;
+        let mut bext_tr = None;
+        let mut ixml_tr = None;
         while pos + 8 <= b.len() {
             let id = &b[pos..pos + 4];
             let mut len = le32(b, pos + 4) as usize;
@@ -58,6 +62,10 @@ impl WavSource {
                     fmt = Some((tag, ch, rate, bits));
                 }
                 b"data" => data = Some((body, len)),
+                // bext: Description 256, Originator 32, OriginatorReference 32, OriginationDate 10,
+                // OriginationTime 8, then TimeReference (low u32, high u32)
+                b"bext" if len >= 346 => bext_tr = Some(le32(b, body + 338) as u64 | (le32(b, body + 342) as u64) << 32),
+                b"iXML" => ixml_tr = ixml_time_reference(&b[body..body + len]),
                 _ => {}
             }
             pos = body + len + (len & 1);
@@ -70,7 +78,8 @@ impl WavSource {
         }
         let frame_bytes = ch as usize * bits as usize / 8;
         let frames = len / frame_bytes;
-        let info = MediaInfo {
+        let time_reference = bext_tr.or(ixml_tr);
+        let mut info = MediaInfo {
             name: name.into(),
             kind: MediaKind::AudioOnly,
             duration: Tick::from_units(frames as i64, rate as i64),
@@ -81,11 +90,23 @@ impl WavSource {
                 codec: if float { "PCM float".into() } else { "PCM".into() },
                 bits_per_sample: Some(bits as u32),
             }),
-            container: "WAV".into(),
+            container: if time_reference.is_some() { "Broadcast WAV".into() } else { "WAV".into() },
             start_timecode: None,
             file_size: Some(b.len() as u64),
         };
-        Ok(Self { info, data_off: off, data_len: frames * frame_bytes, channels: ch as usize, bits, float, rate, bytes })
+        // start timecode: frames at the media's frame rate (the default rate for audio-only media)
+        if let Some(tr) = time_reference.filter(|_| rate > 0) {
+            let r = info.frame_rate();
+            let n = tr as i128 * r.num as i128;
+            let d = rate as i128 * r.den as i128;
+            info.start_timecode = Some(((n + d / 2) / d) as i64);
+        }
+        Ok(Self { info, data_off: off, data_len: frames * frame_bytes, channels: ch as usize, bits, float, rate, bytes, time_reference })
+    }
+
+    /// Broadcast Wave start time: samples since midnight.
+    pub fn time_reference(&self) -> Option<u64> {
+        self.time_reference
     }
 
     fn sample(&self, frame: usize, ch: usize) -> f32 {
@@ -136,6 +157,19 @@ impl MediaSource for WavSource {
     }
 }
 
+/// TimeReference from an iXML chunk (`<BWF_TIME_REFERENCE_LOW>` / `<BWF_TIME_REFERENCE_HIGH>`).
+fn ixml_time_reference(x: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(x);
+    let field = |tag: &str| -> Option<u64> {
+        let open = format!("<{tag}>");
+        let a = text.find(&open)? + open.len();
+        let b = a + text[a..].find('<')?;
+        text[a..b].trim().parse().ok()
+    };
+    let low = field("BWF_TIME_REFERENCE_LOW")?;
+    Some(low | field("BWF_TIME_REFERENCE_HIGH").unwrap_or(0) << 32)
+}
+
 /// Encode interleaved f32 samples as a 16-bit PCM WAV file.
 pub fn write_wav16(samples: &[f32], channels: u16, rate: u32) -> Vec<u8> {
     let data_len = samples.len() * 2;
@@ -172,5 +206,55 @@ mod tests {
         assert!((a.channels[0][3] - s[6]).abs() < 1e-4);
         assert!((a.channels[1][3] - s[7]).abs() < 1e-4);
         assert_eq!(src.info().duration, Tick::from_units(100, 48000));
+        assert_eq!(src.time_reference(), None);
+        assert_eq!(src.info().start_timecode, None);
+    }
+
+    /// Insert a chunk before `data`.
+    fn with_chunk(wav: &[u8], id: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut v = wav[..36].to_vec();
+        v.extend_from_slice(id);
+        v.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        v.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            v.push(0);
+        }
+        v.extend_from_slice(&wav[36..]);
+        let riff = (v.len() - 8) as u32;
+        v[4..8].copy_from_slice(&riff.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn bwf_time_reference_from_bext() {
+        let wav = write_wav16(&[0.0; 96], 2, 48_000);
+        // 01:00:00:00 at 23.976 fps: 86 400 frames of 2002 samples
+        let tr: u64 = 86_400 * 2002;
+        let mut bext = vec![0u8; 602];
+        bext[338..342].copy_from_slice(&(tr as u32).to_le_bytes());
+        bext[342..346].copy_from_slice(&((tr >> 32) as u32).to_le_bytes());
+        let src = WavSource::parse("bwf.wav", with_chunk(&wav, b"bext", &bext).into()).unwrap();
+        assert_eq!(src.time_reference(), Some(tr));
+        assert_eq!(src.info().frame_rate(), filmcraft_time::FrameRate::FPS_23_976);
+        assert_eq!(src.info().start_timecode, Some(86_400));
+        assert_eq!(src.info().container, "Broadcast WAV");
+        // the audio is unaffected
+        assert_eq!(src.info().duration, Tick::from_units(48, 48_000));
+    }
+
+    #[test]
+    fn bwf_time_reference_from_ixml_and_large_values() {
+        let wav = write_wav16(&[0.0; 4], 1, 48_000);
+        let tr: u64 = (1 << 32) + 5;
+        let xml = format!(
+            "<?xml version=\"1.0\"?><BWFXML><BEXT><BWF_TIME_REFERENCE_LOW>{}</BWF_TIME_REFERENCE_LOW><BWF_TIME_REFERENCE_HIGH>{}</BWF_TIME_REFERENCE_HIGH></BEXT></BWFXML>",
+            tr & 0xFFFF_FFFF,
+            tr >> 32
+        );
+        let src = WavSource::parse("ixml.wav", with_chunk(&wav, b"iXML", xml.as_bytes()).into()).unwrap();
+        assert_eq!(src.time_reference(), Some(tr));
+        // a short bext (no TimeReference) is ignored
+        let src = WavSource::parse("short.wav", with_chunk(&wav, b"bext", &[0u8; 100]).into()).unwrap();
+        assert_eq!(src.time_reference(), None);
     }
 }

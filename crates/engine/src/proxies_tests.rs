@@ -84,7 +84,7 @@ fn attach_checks_duration_and_export_ignores_proxies() {
     s.execute("file.exportMedia", json!({"path": png, "format": "png", "wait": true})).unwrap();
     let jobs = s.execute("jobs.list", json!({})).unwrap();
     assert!(jobs.as_array().unwrap().iter().all(|j| j["result"].get("error").is_none()), "{jobs}");
-    let f = image::open(root.join("out_00004.png")).unwrap().to_rgba8();
+    let f = image::open(root.join("out004.png")).unwrap().to_rgba8();
     assert_eq!(psnr(f.as_raw(), &full.2), f64::INFINITY, "export renders full-resolution media");
     s.execute("media.detachProxies", json!({"items": [items[0].0]})).unwrap();
     assert_eq!(frame_rgba(&mut s, 4, 1.0), full);

@@ -27,6 +27,23 @@ pub struct GopStats {
     pub decoded: u64,
     /// Decoded frames evicted from the cache.
     pub evicted: u64,
+    /// Wall time spent inside decoders (`decode` / `flush`), nanoseconds.
+    pub decode_ns: u64,
+    /// Non-reference samples left out while catching up (frames already late).
+    pub skipped: u64,
+}
+
+impl GopStats {
+    /// Share of requests answered from the decoded-frame cache (0 when there were none).
+    pub fn hit_rate(&self) -> f64 {
+        let n = self.hits + self.misses;
+        if n == 0 { 0.0 } else { self.hits as f64 / n as f64 }
+    }
+
+    /// Mean decoder wall time per sample fed (ms).
+    pub fn decode_ms_per_sample(&self) -> f64 {
+        if self.decoded == 0 { 0.0 } else { self.decode_ns as f64 / 1e6 / self.decoded as f64 }
+    }
 }
 
 static HITS: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +51,16 @@ static MISSES: AtomicU64 = AtomicU64::new(0);
 static SEEKS: AtomicU64 = AtomicU64::new(0);
 static DECODED: AtomicU64 = AtomicU64::new(0);
 static EVICTED: AtomicU64 = AtomicU64::new(0);
+static DECODE_NS: AtomicU64 = AtomicU64::new(0);
+static SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Run a decoder call, adding its wall time to the process-wide counter.
+fn timed<R>(f: impl FnOnce() -> R) -> R {
+    let t0 = web_time::Instant::now();
+    let r = f();
+    DECODE_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
 
 /// The counters so far (they only grow; subtract two snapshots to measure an interval).
 pub fn gop_stats() -> GopStats {
@@ -43,6 +70,8 @@ pub fn gop_stats() -> GopStats {
         seeks: SEEKS.load(Ordering::Relaxed),
         decoded: DECODED.load(Ordering::Relaxed),
         evicted: EVICTED.load(Ordering::Relaxed),
+        decode_ns: DECODE_NS.load(Ordering::Relaxed),
+        skipped: SKIPPED.load(Ordering::Relaxed),
     }
 }
 
@@ -55,6 +84,8 @@ impl std::ops::Sub for GopStats {
             seeks: self.seeks - o.seeks,
             decoded: self.decoded - o.decoded,
             evicted: self.evicted - o.evicted,
+            decode_ns: self.decode_ns - o.decode_ns,
+            skipped: self.skipped - o.skipped,
         }
     }
 }
@@ -196,6 +227,14 @@ impl GopCache {
     /// cache's lock. Such a nested request must not lock again (deadlock): it decodes the frame
     /// with a private decoder instead ([`Self::private_frame`]).
     pub fn frame(&self, s: &dyn VideoSamples, target: i64) -> crate::Result<Arc<VideoFrame>> {
+        self.frame_late(s, target, None)
+    }
+
+    /// [`Self::frame`] while catching up: frames shown before `late_before` (track units) are
+    /// late. Non-reference samples of late frames are left out on the way to the wanted frame
+    /// (no other picture depends on them, so the wanted frame decodes exactly as it would
+    /// otherwise; a later request for a skipped frame re-seeks).
+    pub fn frame_late(&self, s: &dyn VideoSamples, target: i64, late_before: Option<i64>) -> crate::Result<Arc<VideoFrame>> {
         let n = s.count();
         let i = s.sample_at(target.max(0)).or_else(|| (n > 0).then(|| n - 1)).ok_or_else(|| CodecError::Decode("empty track".into()))?;
         let want_pts = s.pts(i);
@@ -253,6 +292,7 @@ impl GopCache {
             st.out_max = i64::MIN;
         }
         let limit = (i.max(st.next) + 64).min(n);
+        let late = late_before.unwrap_or(i64::MIN).min(want_pts);
         while st.next < limit {
             if filmcraft_media::cancel::cancelled() {
                 // The decoder state stays consistent (`next`, `out_max`): a later request continues.
@@ -260,7 +300,12 @@ impl GopCache {
             }
             let k = st.next;
             let data = s.read(k)?;
-            let out = st.decoder.as_mut().expect("decoder").decode(&data, s.pts(k))?;
+            if k != i && s.pts(k) < late && st.decoder.as_ref().expect("decoder").is_disposable(&data) {
+                st.next += 1;
+                SKIPPED.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let out = timed(|| st.decoder.as_mut().expect("decoder").decode(&data, s.pts(k)))?;
             st.next += 1;
             DECODED.fetch_add(1, Ordering::Relaxed);
             self.store_output(&mut st, out);
@@ -269,7 +314,7 @@ impl GopCache {
             }
         }
         if !st.frames.contains_key(&want_pts) {
-            let out = st.decoder.as_mut().expect("decoder").flush();
+            let out = timed(|| st.decoder.as_mut().expect("decoder").flush());
             self.store_output(&mut st, out);
             st.next = usize::MAX;
         }
@@ -328,7 +373,7 @@ impl GopCache {
         while *next < limit {
             let k = *next;
             let data = s.read(k)?;
-            let pics = d.decode(&data, s.pts(k))?;
+            let pics = timed(|| d.decode(&data, s.pts(k)))?;
             *next += 1;
             found |= pics.iter().any(|p| p.pts == want_pts);
             out.extend(pics);
@@ -337,7 +382,7 @@ impl GopCache {
             }
         }
         if !found {
-            out.extend(d.flush());
+            out.extend(timed(|| d.flush()));
             *next = usize::MAX;
         }
         Ok(out)
@@ -355,7 +400,7 @@ impl GopCache {
         };
         let res = s.read(i).and_then(|data| {
             DECODED.fetch_add(1, Ordering::Relaxed);
-            dec.decode(&data, want_pts)
+            timed(|| dec.decode(&data, want_pts))
         });
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.spare.len() < 16 {
@@ -425,6 +470,10 @@ mod tests {
         }
         fn intra_only(&self) -> bool {
             self.intra
+        }
+        // odd samples are non-reference pictures
+        fn is_disposable(&self, sample: &[u8]) -> bool {
+            sample[0] % 2 == 1
         }
     }
 
@@ -508,6 +557,39 @@ mod tests {
         // a frame two threads miss at the same moment may decode twice; nothing more
         assert!(s.decodes.load(Ordering::Relaxed) <= 64 + 4 * 4);
         assert_eq!(s.resets.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn catching_up_skips_late_non_reference_samples_only() {
+        let s = samples(300, 250, 4, false);
+        let c = GopCache::new(None);
+        assert_eq!(index_of(&c.frame(&s, 2_000).expect("frame")), 2);
+        let before = s.decodes.load(Ordering::Relaxed);
+        // playback is behind: frame 41 is due, 7..=40 are late
+        let f = c.frame_late(&s, 41_000, Some(41_000)).expect("frame");
+        assert_eq!(index_of(&f), 41, "the wanted (odd, disposable) frame itself is decoded");
+        let fed = s.decodes.load(Ordering::Relaxed) - before;
+        // samples 7..41 minus the odd ones before 41, plus the decoder's output delay
+        assert!(fed <= 18 + 4 + 1, "fed {fed}");
+        // the decoder continues from there: the next frames are decoded, not skipped
+        for i in 42..48usize {
+            assert_eq!(index_of(&c.frame(&s, i as i64 * 1000).expect("frame")), i);
+        }
+        assert_eq!(s.resets.load(Ordering::Relaxed), 1);
+        // without the hint nothing is skipped
+        let s2 = samples(300, 250, 4, false);
+        let c2 = GopCache::new(None);
+        assert_eq!(index_of(&c2.frame(&s2, 41_000).expect("frame")), 41);
+        assert!(s2.decodes.load(Ordering::Relaxed) >= 42);
+        // a prefetch job for frame 41 while frame 30 is due: only frames before 30 are late
+        let s3 = samples(300, 250, 0, false);
+        let c3 = GopCache::new(None);
+        assert_eq!(index_of(&c3.frame_late(&s3, 41_000, Some(30_000)).expect("frame")), 41);
+        assert_eq!(s3.decodes.load(Ordering::Relaxed), 42 - 15, "odd samples 1..=29 skipped");
+        for i in 30..41usize {
+            assert_eq!(index_of(&c3.frame(&s3, i as i64 * 1000).expect("cached")), i);
+        }
+        assert_eq!(s3.resets.load(Ordering::Relaxed), 1);
     }
 
     #[test]

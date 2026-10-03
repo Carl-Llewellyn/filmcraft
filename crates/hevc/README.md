@@ -135,7 +135,15 @@ average 50-100), so these are lower bounds:
 | 1080p Main, x265 medium CRF 24, 60 frames | ~75 fps | ~225 fps |
 | 2160p Main 10, x265 fast CRF 26, 20 frames | ~20 fps | ~95 fps |
 
-No SIMD-specific code yet; interpolation, transforms and loop filters are plain loops.
+No SIMD-specific code yet; interpolation, transforms and loop filters are plain loops. M4.8
+profiling (`cargo xtask bench`, macOS `sample`) found the inverse transform at over half of the
+decoder's CPU time: it evaluated the full matrix product with strided table reads. It now sums
+contiguous basis rows scaled by the non-zero coefficients only, with the block size a compile-time
+constant so the loops vectorise (exact integer sums, so bit-exact; `transform::tests` checks it
+against the direct product on random sparse and dense blocks). SAO edge offset has a check-free
+loop for samples whose neighbours are inside the CTB. Together: ~60 % less CPU per frame
+(1080p 78 → 33 ms, 2160p 320 → 129 ms of CPU per frame through the media stack, alternating A/B), see
+[docs/performance.md](../../docs/performance.md).
 `cargo run --release -p filmcraft-hevc --example hevcdec -- in.hevc out.yuv` decodes a file.
 
 ## Known gaps

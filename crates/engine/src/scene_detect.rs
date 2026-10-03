@@ -239,7 +239,7 @@ pub fn poll(s: &mut Session) {
         let pj = s.scene_jobs.remove(i);
         let Some(results) = lock(&pj.results).take().filter(|_| !cancelled) else { continue };
         if let Err(e) = apply_results(s, pj.seq, pj.apply, results) {
-            s.events.push(crate::Event::Toast { message: format!("Scene Edit Detection: {e}"), error: true });
+            s.error_toast("clip.sceneEditDetection", format!("Scene Edit Detection: {e}"));
         }
     }
 }

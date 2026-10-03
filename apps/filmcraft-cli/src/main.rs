@@ -3,6 +3,7 @@
 //! Run `filmcraft-cli help` for the full reference (also in docs/agents.md).
 
 mod args;
+mod probe;
 
 use args::{Args, parse_value};
 use filmcraft_automation::BridgeClient;
@@ -23,10 +24,18 @@ SUBCOMMANDS
   describe <id>                 one command as JSON (menu, shortcut, params, enabled now)
   inspect [project|sequence]    project tree or active sequence as JSON (default: both)
   import <file>...              import media into the project
-  export <out> [--format f]     export the active sequence (h264|prores|dnxhr|mjpeg|png|gif|wav;
-                                guessed from the extension) and wait for it to finish
+  export <out> [--preset name] [--format f] [--range r] [--start s --end s] [--settings json]
+                                export the active sequence and wait for it to finish: with an
+                                export preset (`export --list-presets`; built-in or the user's), or
+                                a format (h264|prores|dnxhr|mjpeg|png|tiff|bmp|gif|wav|aiff, guessed
+                                from the extension); --range entire|inOut|workArea, or a custom
+                                range in seconds; --settings is ExportSettings JSON merged over the
+                                preset; --queue adds to the export queue and runs it instead
+  export --list-presets [query] list export presets (name, category, format) as JSON
   render --seconds S --out f.png [--scale 0.5]   render one Program frame to PNG
-  probe <media>                 media info as JSON
+  probe <media> [--image-sequence]
+                                media info as JSON, with MXF / Ogg / BWF details; with
+                                --image-sequence <media> is the first numbered still of a sequence
   bench-decode <media> [--frames N]
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
   help                          this text
@@ -38,6 +47,8 @@ OPTIONS
   --save                        save the project back to --project when done
   --save-as <p.fcproj>          save the project to this path when done
   --bridge <127.0.0.1:PORT>     send commands to the running app (`filmcraft --control PORT`)
+  --data-dir <dir>              FilmCraft data directory for user export presets (headless;
+                                default: the app's data directory)
   --keep-going                  `run`: report failing lines and continue
   --compact                     one-line JSON output
 
@@ -75,6 +86,10 @@ impl Backend {
             return Backend::Bridge(BridgeClient::new(addr).unwrap_or_else(|e| usage(e)));
         }
         let mut s = Session::default();
+        // user export presets (and other per-user libraries) from the data directory
+        if let Some(dir) = a.opt("--data-dir").map(std::path::PathBuf::from).or_else(filmcraft_engine::autosave::default_data_dir) {
+            s.export_presets.set_dir(&dir);
+        }
         if let Some(p) = a.opt("--project") {
             if let Err(e) = s.execute("file.open", json!({"path": p})) {
                 fail(e);
@@ -125,6 +140,9 @@ fn format_for(path: &str) -> Option<&'static str> {
         "png" => "png",
         "gif" => "gif",
         "wav" => "wav",
+        "tif" | "tiff" => "tiff",
+        "bmp" => "bmp",
+        "aif" | "aiff" => "aiff",
         _ => return None,
     })
 }
@@ -141,11 +159,10 @@ async fn main() {
         "help" | "--help" | "-h" => print!("{HELP}"),
         "version" => println!("filmcraft-cli {}", env!("CARGO_PKG_VERSION")),
         "probe" => {
-            let path = a.pos(1).unwrap_or_else(|| usage("probe <media>"));
-            let bytes = std::fs::read(path).unwrap_or_else(|e| fail(format!("{path}: {e}")));
-            match filmcraft_codecs::open_bytes(path, bytes.into()) {
-                Ok(src) => print(&a, &serde_json::to_value(src.info()).unwrap_or_default()),
-                Err(e) => fail(format!("{path}: {e}")),
+            let path = a.pos(1).unwrap_or_else(|| usage("probe <media> [--image-sequence]"));
+            match probe::probe(path, a.flag("--image-sequence")) {
+                Ok(v) => print(&a, &v),
+                Err(e) => fail(e),
             }
         }
         "bench-decode" => {
@@ -256,20 +273,61 @@ async fn main() {
             b.finish(&a).await;
         }
         "export" => {
-            let out = a.pos(1).unwrap_or_else(|| usage("export <out> [--format f]"));
-            let format = a.opt("--format").or_else(|| format_for(out)).unwrap_or_else(|| usage("export: give --format (unknown extension)"));
-            let mut p = json!({"path": out, "format": format, "wait": true});
+            if a.flag("--list-presets") {
+                let mut b = Backend::open(&a);
+                let q = a.pos(1).map(|q| json!({"query": q})).unwrap_or(json!({}));
+                match b.exec("export.presets.list", q).await {
+                    Ok(v) => print(&a, &v["presets"]),
+                    Err(e) => fail(format!("export: {e}")),
+                }
+                return;
+            }
+            let out = a.pos(1).unwrap_or_else(|| usage("export <out> [--preset name | --format f]"));
+            let mut p = json!({"path": out, "wait": true});
+            match (a.opt("--preset"), a.opt("--format")) {
+                (Some(preset), f) => {
+                    p["preset"] = json!(preset);
+                    if let Some(f) = f {
+                        p["format"] = json!(f);
+                    }
+                }
+                (None, f) => {
+                    let format = f.or_else(|| format_for(out)).unwrap_or_else(|| usage("export: give --preset or --format (unknown extension)"));
+                    p["format"] = json!(format);
+                }
+            }
             for (k, key) in [("--scale", "scale"), ("--quality", "quality")] {
                 if let Some(v) = a.opt(k) {
                     p[key] = parse_value(v);
                 }
+            }
+            if let Some(r) = a.opt("--range") {
+                p["range"] = json!(r);
+            }
+            if let (Some(s0), Some(s1)) = (a.opt("--start"), a.opt("--end")) {
+                p["range"] = json!("custom");
+                p["startSeconds"] = parse_value(s0);
+                p["endSeconds"] = parse_value(s1);
+            }
+            if let Some(js) = a.opt("--settings") {
+                p["settings"] = serde_json::from_str(js).unwrap_or_else(|e| usage(format!("--settings: {e}")));
             }
             if a.flag("--no-audio") {
                 p["audio"] = json!(false);
             }
             let mut b = Backend::open(&a);
             let t0 = std::time::Instant::now();
-            match b.exec("file.exportMedia", p).await {
+            let r = if a.flag("--queue") {
+                let mut q = p.clone();
+                q["start"] = json!(true);
+                b.exec("export.queue.add", q).await.and_then(|v| {
+                    let failed: Vec<&Value> = v["items"].as_array().map(|i| i.iter().filter(|x| x["status"] != "done").collect()).unwrap_or_default();
+                    if failed.is_empty() { Ok(v) } else { Err(format!("queue: {}", Value::Array(failed.into_iter().cloned().collect()))) }
+                })
+            } else {
+                b.exec("file.exportMedia", p).await
+            };
+            match r {
                 Ok(v) => {
                     print(&a, &v);
                     eprintln!("exported {out} in {:.1}s", t0.elapsed().as_secs_f64());
