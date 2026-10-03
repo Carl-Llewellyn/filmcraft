@@ -365,9 +365,9 @@ pub struct UiState {
     pub expanded_fx: Vec<String>,
     /// Collapsed effect sections in Effect Controls ("clip:index").
     pub collapsed_fx: Vec<String>,
-    /// Selected Effect Controls keyframe (Delete removes it).
+    /// Selected Effect Controls keyframes (Delete removes them).
     #[serde(default)]
-    pub effect_keyframe: Option<EffectKeyframeSelection>,
+    pub effect_keyframes: Vec<EffectKeyframeSelection>,
     pub show_menu_bar: bool,
     pub dark: bool,
     /// Lumetri scopes visible in the Program monitor area.
@@ -711,7 +711,7 @@ impl Default for UiState {
             expanded_bins: vec![],
             expanded_fx: vec!["Video Transitions".into(), "Video Transitions/Dissolve".into()],
             collapsed_fx: vec![],
-            effect_keyframe: None,
+            effect_keyframes: vec![],
             show_menu_bar: true,
             dark: true,
             show_scopes: false,

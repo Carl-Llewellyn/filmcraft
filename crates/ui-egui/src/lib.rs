@@ -719,7 +719,7 @@ impl FilmcraftApp {
             return;
         }
         if self.ui.focused == PanelKind::EffectControls
-            && self.ui.effect_keyframe.is_some()
+            && !self.ui.effect_keyframes.is_empty()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
             && panels::effect_controls::delete_selected_keyframe(self)
         {
