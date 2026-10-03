@@ -3,7 +3,7 @@
 //! keyframe lane on the right. Also hosts the Lumetri Color panel body (same editor, grouped).
 
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, pos2, vec2};
-use filmcraft_project::{ClipId, EffectInstance, ParamKind, ParamValue, TrackItem};
+use filmcraft_project::{ClipId, EffectInstance, Keyframe, ParamKind, ParamValue, TrackItem};
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
@@ -12,6 +12,15 @@ use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
 const ROW_H: f32 = 22.0;
+
+#[derive(Clone, Debug)]
+pub(crate) struct KeyframeClipboardEntry {
+    effect: String,
+    param: String,
+    mask: Option<usize>,
+    offset: i64,
+    keyframe: Keyframe,
+}
 
 fn selected_clip(app: &FilmcraftApp) -> Option<(ClipId, TrackItem, filmcraft_project::TrackKind)> {
     let seq = app.session.active_sequence()?;
@@ -26,6 +35,91 @@ fn selected_clip(app: &FilmcraftApp) -> Option<(ClipId, TrackItem, filmcraft_pro
         }
     }
     best
+}
+
+pub(crate) fn copy_selected_keyframes(app: &mut FilmcraftApp) -> bool {
+    let Some((clip, item, _)) = selected_clip(app) else { return false };
+    let mut selected = Vec::new();
+    for selection in app.ui.effect_keyframes.iter().filter(|selection| selection.clip == clip.0) {
+        let Some(effect) = item.effects.iter().find(|effect| effect.effect == selection.effect) else { continue };
+        let param = match selection.mask {
+            Some(mask) => effect.masks.get(mask).and_then(|mask| mask.param(&selection.param)),
+            None => effect.params.get(&selection.param),
+        };
+        let Some(keyframe) = param.and_then(|param| param.keyframes.iter().find(|key| key.time.0 == selection.media_time)).cloned() else { continue };
+        let timeline_time = item.start + Tick(((keyframe.time - item.source_in).0 as f64 / item.speed.abs().max(1e-6)) as i64);
+        selected.push((selection.effect.clone(), selection.param.clone(), selection.mask, timeline_time, keyframe));
+    }
+    let Some(anchor) = selected.iter().map(|entry| entry.3).min() else {
+        app.ui.status = "Select keyframes in Effect Controls to copy".into();
+        return true;
+    };
+    app.keyframe_clipboard = selected
+        .into_iter()
+        .map(|(effect, param, mask, time, keyframe)| KeyframeClipboardEntry { effect, param, mask, offset: (time - anchor).0, keyframe })
+        .collect();
+    app.ui.status = format!("Copied {} keyframe{}", app.keyframe_clipboard.len(), if app.keyframe_clipboard.len() == 1 { "" } else { "s" });
+    true
+}
+
+pub(crate) fn paste_keyframes(app: &mut FilmcraftApp) -> bool {
+    if app.keyframe_clipboard.is_empty() {
+        return false;
+    }
+    let Some((clip, item, _)) = selected_clip(app) else {
+        app.ui.status = "Select a destination clip to paste keyframes".into();
+        return true;
+    };
+    let anchor = app.session.playhead().clamp(item.start, item.end() - Tick(1));
+    let mut tracks: Vec<Value> = Vec::new();
+    for entry in &app.keyframe_clipboard {
+        let timeline_time = anchor + Tick(entry.offset);
+        if timeline_time < item.start || timeline_time >= item.end() {
+            continue;
+        }
+        let Some(effect) = item.effects.iter().find(|effect| effect.effect == entry.effect) else { continue };
+        let param = match entry.mask {
+            Some(mask) => effect.masks.get(mask).and_then(|mask| mask.param(&entry.param)),
+            None => effect.params.get(&entry.param),
+        };
+        let Some(param) = param else { continue };
+        if std::mem::discriminant(&entry.keyframe.value) != std::mem::discriminant(&param.value) {
+            continue;
+        }
+        let media_time = item.source_time_at(timeline_time);
+        let mut keyframe = entry.keyframe.clone();
+        keyframe.time = media_time;
+        let serialized = match serde_json::to_value(keyframe) {
+            Ok(value) => value,
+            Err(error) => {
+                app.ui.status = error.to_string();
+                return true;
+            }
+        };
+        if let Some(track) = tracks.iter_mut().find(|track| {
+            track["effect"] == entry.effect && track["param"] == entry.param && track.get("mask").and_then(Value::as_u64) == entry.mask.map(|mask| mask as u64)
+        }) {
+            track["keyframes"].as_array_mut().unwrap().push(serialized);
+        } else {
+            let mut track = json!({"effect": entry.effect, "param": entry.param, "keyframes": [serialized]});
+            if let Some(mask) = entry.mask {
+                track["mask"] = json!(mask);
+            }
+            tracks.push(track);
+        }
+    }
+    if tracks.is_empty() {
+        app.ui.status = "No matching keyframe parameters on the destination clip".into();
+        return true;
+    }
+    match app.session.execute("effects.pasteKeyframes", json!({"clip": clip.0, "tracks": tracks})) {
+        Ok(_) => {
+            let count: usize = tracks.iter().filter_map(|track| track["keyframes"].as_array().map(Vec::len)).sum();
+            app.ui.status = format!("Pasted {count} keyframe{}", if count == 1 { "" } else { "s" });
+        }
+        Err(error) => app.ui.status = error.to_string(),
+    }
+    true
 }
 
 /// Delete the selected keyframe when Delete is pressed in Effect Controls. Return true whenever

@@ -129,6 +129,8 @@ const SCREENSHOT_TIMEOUT_S: f64 = 10.0;
 pub struct FilmcraftApp {
     pub session: Session,
     pub ui: UiState,
+    /// Transient clipboard for Effect Controls keyframes, independent of the timeline clip clipboard.
+    pub(crate) keyframe_clipboard: Vec<panels::effect_controls::KeyframeClipboardEntry>,
     pub tokens: Tokens,
     pub frames: Arc<FrameServer>,
     pub playback: Playback,
@@ -228,6 +230,7 @@ impl FilmcraftApp {
         Self {
             session,
             ui: UiState::default(),
+            keyframe_clipboard: Vec::new(),
             tokens: Tokens::for_kind(ThemeKind::Dark),
             frames,
             playback: Playback { speed: 1.0, ..Default::default() },
@@ -717,6 +720,16 @@ impl FilmcraftApp {
         }
         if ctx.egui_wants_keyboard_input() || self.dialog == Some(Dialog::Shortcuts) {
             return;
+        }
+        if self.ui.focused == PanelKind::EffectControls {
+            let copy = !self.ui.effect_keyframes.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::C));
+            if copy && panels::effect_controls::copy_selected_keyframes(self) {
+                return;
+            }
+            let paste = !self.keyframe_clipboard.is_empty() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::V));
+            if paste && panels::effect_controls::paste_keyframes(self) {
+                return;
+            }
         }
         if self.ui.focused == PanelKind::EffectControls
             && !self.ui.effect_keyframes.is_empty()

@@ -1978,6 +1978,45 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             |s, p| keyframe_op(s, p, "set")
         ),
+        cmd!(
+            "effects.pasteKeyframes",
+            "Paste Effect Keyframes",
+            [],
+            None,
+            r#"{\"clip\":id,\"tracks\":[{\"effect\":str,\"param\":str,\"mask\":n?,\"keyframes\":[Keyframe]}]}"#,
+            has_seq,
+            |s, p| {
+                let c = clip_p(p, "clip").ok_or_else(|| bad("effects.pasteKeyframes", "need `clip`"))?;
+                let tracks = p.get("tracks").and_then(Value::as_array).ok_or_else(|| bad("effects.pasteKeyframes", "need `tracks`"))?.clone();
+                s.edit_sequence("Paste Effect Keyframes", |q, _, _| {
+                    let (_, it) = q.find_item_mut(c).ok_or(filmcraft_edit::EditError::NoItem(c))?;
+                    for track in &tracks {
+                        let effect = str_p(track, "effect").ok_or_else(|| bad("effects.pasteKeyframes", "track needs `effect`"))?;
+                        let param = str_p(track, "param").ok_or_else(|| bad("effects.pasteKeyframes", "track needs `param`"))?;
+                        let e = it
+                            .effects
+                            .iter_mut()
+                            .find(|e| e.effect == effect)
+                            .ok_or_else(|| bad("effects.pasteKeyframes", format!("effect `{effect}` is not on destination clip")))?;
+                        let prm = crate::masks::target_param(e, track, param)
+                            .ok_or_else(|| bad("effects.pasteKeyframes", format!("parameter `{param}` is not on destination effect")))?;
+                        let keys = track.get("keyframes").and_then(Value::as_array).ok_or_else(|| bad("effects.pasteKeyframes", "track needs `keyframes`"))?;
+                        for value in keys {
+                            let key: filmcraft_project::Keyframe =
+                                serde_json::from_value(value.clone()).map_err(|e| bad("effects.pasteKeyframes", e.to_string()))?;
+                            if std::mem::discriminant(&key.value) != std::mem::discriminant(&prm.value) {
+                                return Err(bad("effects.pasteKeyframes", format!("keyframe value type does not match `{param}`")));
+                            }
+                            prm.keyframes.retain(|existing| existing.time != key.time);
+                            let at = prm.keyframes.partition_point(|existing| existing.time < key.time);
+                            prm.keyframes.insert(at, key);
+                        }
+                    }
+                    Ok(())
+                })?;
+                Ok(Value::Null)
+            }
+        ),
         // ================= Project panel =================
         cmd!("project.select", "Select Project Items", [], None, r#"{"items":[id]}"#, always, |s, p| {
             s.state.project_selection =

@@ -99,6 +99,26 @@ fn effects_and_keyframes() {
 }
 
 #[test]
+fn paste_effect_keyframes_preserves_keyframe_data() {
+    let mut s = demo();
+    let destination = s.active_sequence().unwrap().video_tracks[0].items[1].id.0;
+    let key = filmcraft_project::Keyframe {
+        time: Tick(48_000),
+        value: filmcraft_project::ParamValue::Float(142.0),
+        interp: filmcraft_project::Interpolation::Bezier,
+        out_influence: 0.2,
+        in_influence: 0.8,
+    };
+    s.execute("effects.pasteKeyframes", json!({"clip": destination, "tracks": [{"effect": "motion", "param": "scale", "keyframes": [key]}]})).unwrap();
+    let param = &s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(destination)).unwrap().1.effect("motion").unwrap().params["scale"];
+    assert_eq!(param.keyframes.len(), 1);
+    assert_eq!(param.keyframes[0].value, filmcraft_project::ParamValue::Float(142.0));
+    assert_eq!(param.keyframes[0].interp, filmcraft_project::Interpolation::Bezier);
+    assert_eq!(param.keyframes[0].out_influence, 0.2);
+    assert_eq!(param.keyframes[0].in_influence, 0.8);
+}
+
+#[test]
 fn transitions_and_markers() {
     let mut s = demo();
     let q = s.active_sequence().unwrap();
