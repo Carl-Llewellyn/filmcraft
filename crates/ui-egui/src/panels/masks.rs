@@ -41,6 +41,7 @@ pub fn effect_rows(
     lane: &Rect,
     lx: &dyn Fn(Tick) -> f32,
     it: &TrackItem,
+    marquee_rect: Option<Rect>,
 ) {
     let t = app.tokens;
     // creation tools: ellipse, 4-point polygon, free-draw Bézier
@@ -133,7 +134,7 @@ pub fn effect_rows(
             continue;
         }
         for pd in defs {
-            crate::panels::effect_controls::param_row(app, ui, body, clip, idx, e, Some(k), pd, mt, actions, lane, lx, it);
+            crate::panels::effect_controls::param_row(app, ui, body, clip, idx, e, Some(k), pd, mt, actions, lane, lx, it, marquee_rect);
             if pd.id != "path"
                 && app.ui.expanded_fx.contains(&crate::panels::effect_controls::graph_key(clip, idx, &format!("mask{k}.{}", pd.id)))
                 && let Some(param) = m.param(pd.id)

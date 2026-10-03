@@ -138,6 +138,23 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.stop();
         app.session.set_playhead(tk);
     }
+    // A single marquee spans the whole keyframe column, so it can collect points from
+    // different effects and parameters at once.
+    let keyframe_area = Rect::from_min_max(pos2(lane.min.x, lane.min.y + 33.0), lane.max);
+    let marquee_id = egui::Id::new(("keyframe-marquee", clip.0));
+    let marquee = ui.interact(keyframe_area, marquee_id, Sense::click_and_drag());
+    let marquee_start: Option<Pos2> = ui.data(|d| d.get_temp(marquee_id));
+    if marquee.drag_started() {
+        let start = marquee.interact_pointer_pos().unwrap_or(marquee.rect.min);
+        ui.data_mut(|d| d.insert_temp(marquee_id, start));
+        if !ui.input(|i| i.modifiers.shift) {
+            app.ui.effect_keyframes.clear();
+        }
+    }
+    let marquee_rect = marquee_start.and_then(|start| marquee.interact_pointer_pos().map(|pos| Rect::from_two_pos(start, pos)));
+    if marquee.drag_stopped() {
+        ui.data_mut(|d| d.remove::<Pos2>(marquee_id));
+    }
     let body = Rect::from_min_max(pos2(rect.min.x, head.max.y + 4.0), pos2(split, rect.max.y - 26.0));
     let mut actions: Vec<(String, Value)> = Vec::new();
     let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("ec-body"));
@@ -218,7 +235,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 custom_setup_row(app, bui, body, clip, idx, &e.effect);
             }
             for pd in &def.params {
-                param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, &it);
+                param_row(app, bui, body, clip, idx, e, None, pd, mt_now, &mut actions, &lane, &lx, &it, marquee_rect);
                 if app.ui.expanded_fx.contains(&graph_key(clip, idx, pd.id))
                     && let Some(param) = e.params.get(pd.id)
                     && param.is_animated()
@@ -228,11 +245,15 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
             }
             if crate::panels::masks::maskable(e) {
-                crate::panels::masks::effect_rows(app, bui, body, clip, idx, e, mt_now, &mut actions, &lane, &lx, &it);
+                crate::panels::masks::effect_rows(app, bui, body, clip, idx, e, mt_now, &mut actions, &lane, &lx, &it, marquee_rect);
             }
         }
     });
     let _ = scroll_out;
+    if let Some(selection_rect) = marquee_rect.filter(|_| marquee.dragged()) {
+        ui.painter().rect_filled(selection_rect, 1.0, Color32::from_rgba_unmultiplied(70, 140, 255, 45));
+        ui.painter().rect_stroke(selection_rect, 1.0, Stroke::new(1.0, t.hot_text), egui::StrokeKind::Inside);
+    }
     // playhead in lane
     let px = lx(ph);
     ui.painter().line_segment([pos2(px, lane.min.y), pos2(px, lane.max.y)], Stroke::new(1.0, t.playhead));
@@ -281,6 +302,7 @@ pub(crate) fn param_row(
     lane: &Rect,
     lx: &dyn Fn(Tick) -> f32,
     it: &TrackItem,
+    marquee_rect: Option<Rect>,
 ) {
     let _ = lx;
     let t = app.tokens;
@@ -455,21 +477,7 @@ pub(crate) fn param_row(
         let y = r.center().y;
         let dur = it.duration.0.max(1) as f64;
         let rate = app.session.sequence_rate();
-        let lane_row = Rect::from_min_max(pos2(lane.min.x, r.min.y), pos2(lane.max.x, r.max.y));
-        let marquee_id = egui::Id::new(("keyframe-marquee", clip.0, idx, pkey));
-        let marquee = ui.interact(lane_row, marquee_id, Sense::click_and_drag());
-        let marquee_start: Option<Pos2> = ui.data(|d| d.get_temp(marquee_id));
-        if marquee.drag_started() {
-            let start = marquee.interact_pointer_pos().unwrap_or(marquee.rect.min);
-            ui.data_mut(|d| d.insert_temp(marquee_id, start));
-            if !ui.input(|i| i.modifiers.shift) {
-                app.ui.effect_keyframes.clear();
-            }
-        }
-        let marquee_rect = marquee_start.and_then(|start| marquee.interact_pointer_pos().map(|pos| Rect::from_two_pos(start, pos)));
-        if marquee.dragged()
-            && let Some(selection_rect) = marquee_rect
-        {
+        if let Some(selection_rect) = marquee_rect {
             for k in &param.keyframes {
                 let tl = it.start + Tick(((k.time - it.source_in).0 as f64 / it.speed.abs().max(1e-6)) as i64);
                 let f = ((tl - it.start).0 as f64 / dur) as f32;
@@ -482,13 +490,6 @@ pub(crate) fn param_row(
                     }
                 }
             }
-        }
-        if marquee.drag_stopped() {
-            ui.data_mut(|d| d.remove::<Pos2>(marquee_id));
-        }
-        if let Some(selection_rect) = marquee_rect.filter(|_| marquee.dragged()) {
-            ui.painter().rect_filled(selection_rect, 1.0, Color32::from_rgba_unmultiplied(70, 140, 255, 45));
-            ui.painter().rect_stroke(selection_rect, 1.0, Stroke::new(1.0, t.hot_text), egui::StrokeKind::Inside);
         }
         for k in &param.keyframes {
             let tl = it.start + Tick(((k.time - it.source_in).0 as f64 / it.speed.abs().max(1e-6)) as i64);
