@@ -333,6 +333,17 @@ pub enum ProjectView {
     Freeform,
 }
 
+/// The keyframe currently selected in Effect Controls; transient UI selection, not project data.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffectKeyframeSelection {
+    pub clip: u64,
+    pub effect: String,
+    pub param: String,
+    #[serde(default)]
+    pub mask: Option<usize>,
+    pub media_time: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UiState {
     pub tool: Tool,
@@ -354,6 +365,9 @@ pub struct UiState {
     pub expanded_fx: Vec<String>,
     /// Collapsed effect sections in Effect Controls ("clip:index").
     pub collapsed_fx: Vec<String>,
+    /// Selected Effect Controls keyframe (Delete removes it).
+    #[serde(default)]
+    pub effect_keyframe: Option<EffectKeyframeSelection>,
     pub show_menu_bar: bool,
     pub dark: bool,
     /// Lumetri scopes visible in the Program monitor area.
@@ -697,6 +711,7 @@ impl Default for UiState {
             expanded_bins: vec![],
             expanded_fx: vec!["Video Transitions".into(), "Video Transitions/Dissolve".into()],
             collapsed_fx: vec![],
+            effect_keyframe: None,
             show_menu_bar: true,
             dark: true,
             show_scopes: false,

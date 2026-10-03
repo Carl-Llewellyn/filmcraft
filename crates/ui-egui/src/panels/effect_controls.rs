@@ -28,6 +28,42 @@ fn selected_clip(app: &FilmcraftApp) -> Option<(ClipId, TrackItem, filmcraft_pro
     best
 }
 
+/// Delete the selected keyframe when Delete is pressed in Effect Controls. Return true whenever
+/// a keyframe selection was handled so the application's general Delete shortcut cannot clear
+/// the selected timeline clip instead.
+pub(crate) fn delete_selected_keyframe(app: &mut FilmcraftApp) -> bool {
+    let Some(selected) = app.ui.effect_keyframe.clone() else { return false };
+    let valid = selected_clip(app).is_some_and(|(clip, item, _)| {
+        clip.0 == selected.clip
+            && item
+                .effects
+                .iter()
+                .find(|e| e.effect == selected.effect)
+                .and_then(|e| match selected.mask {
+                    Some(mask) => e.masks.get(mask).and_then(|m| m.param(&selected.param)),
+                    None => e.params.get(&selected.param),
+                })
+                .is_some_and(|p| p.keyframes.iter().any(|k| k.time.0 == selected.media_time))
+    });
+    app.ui.effect_keyframe = None;
+    if !valid {
+        return true;
+    }
+    let mut params = json!({
+        "clip": selected.clip,
+        "effect": selected.effect,
+        "param": selected.param,
+        "mediaTime": selected.media_time,
+    });
+    if let Some(mask) = selected.mask {
+        params["mask"] = json!(mask);
+    }
+    if let Err(e) = app.session.execute("effects.deleteKeyframe", params) {
+        app.ui.status = e.to_string();
+    }
+    true
+}
+
 pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
     let Some((clip, it, kind)) = selected_clip(app) else {
@@ -427,9 +463,15 @@ pub(crate) fn param_row(
             let drag_off: Option<f32> = ui.data(|d| d.get_temp(id));
             let kx = lane.min.x + f * lane.width() + drag_off.unwrap_or(0.0);
             let kr = Rect::from_center_size(pos2(kx, y), vec2(11.0, 11.0));
-            let resp = ui.interact(kr.expand(2.0), id, Sense::click_and_drag());
+            let resp = ui.interact(kr.expand(2.0), id, Sense::click_and_drag()).on_hover_text("Select keyframe · press Delete to remove");
             app.auto.add(&format!("effectControls.{}.{}.keyframe.{}", e.effect, pkey, k.time.0), kr, "keyframe");
-            let sel = k.time == mt || resp.dragged();
+            let sel = k.time == mt
+                || app
+                    .ui
+                    .effect_keyframe
+                    .as_ref()
+                    .is_some_and(|s| s.clip == clip.0 && s.effect == e.effect && s.param == pd.id && s.mask == mask && s.media_time == k.time.0)
+                || resp.dragged();
             let col = if sel { t.hot_text } else { Color32::from_rgb(0xb0, 0xb0, 0xb0) };
             match k.interp {
                 filmcraft_project::Interpolation::Hold => {
@@ -458,6 +500,13 @@ pub(crate) fn param_row(
                 }
             }
             if resp.clicked() {
+                app.ui.effect_keyframe = Some(crate::state::EffectKeyframeSelection {
+                    clip: clip.0,
+                    effect: e.effect.clone(),
+                    param: pd.id.to_string(),
+                    mask,
+                    media_time: k.time.0,
+                });
                 actions.push(("playhead.set".into(), json!({"time": tl.0})));
             }
             resp.context_menu(|ui| {
