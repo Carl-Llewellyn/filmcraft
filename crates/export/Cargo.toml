@@ -13,6 +13,7 @@ workspace = true
 filmcraft-time = { workspace = true }
 filmcraft-frame = { workspace = true }
 filmcraft-color = { workspace = true }
+filmcraft-bitstream = { workspace = true }
 filmcraft-media = { workspace = true }
 filmcraft-project = { workspace = true }
 filmcraft-render = { workspace = true }
@@ -27,6 +28,9 @@ thiserror = { workspace = true }
 rayon = { workspace = true }
 web-time = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+shiguredo_nvcodec = "=2026.2.0"
 
 [dev-dependencies]
 filmcraft-testkit = { workspace = true }

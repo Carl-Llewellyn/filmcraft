@@ -49,14 +49,32 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let half = (head.width() - 6.0) / 2.0;
     pill(ui, Rect::from_min_size(head.min, vec2(half, 24.0)), &format!("Source · {}", it.name), false);
     pill(ui, Rect::from_min_size(head.min + vec2(half + 6.0, 0.0), vec2(half, 24.0)), &format!("{} · {}", seq_name(app), it.name), true);
-    // keyframe lane header: mini ruler over the clip's duration
+    // Keyframe lane header: a compact time ruler above the clip strip. Keeping ticks and labels
+    // separate from the clip name makes it possible to orient keyframes in time at a glance.
     let lane = Rect::from_min_max(pos2(split + 4.0, rect.min.y + 4.0), pos2(rect.max.x - 6.0, rect.max.y - 26.0));
     ui.painter().rect_filled(lane, 0.0, t.tl_bg);
     let ph = app.session.playhead();
     let dur = it.duration.0.max(1) as f64;
     let lx = |tk: Tick| -> f32 { lane.min.x + (((tk - it.start).0 as f64 / dur) as f32).clamp(0.0, 1.0) * lane.width() };
-    ui.painter().rect_filled(Rect::from_min_max(pos2(lane.min.x, lane.min.y + 2.0), pos2(lane.max.x, lane.min.y + 16.0)), 2.0, Color32::from_rgb(58, 58, 70));
-    ui.painter().text(pos2(lane.min.x + 4.0, lane.min.y + 9.0), Align2::LEFT_CENTER, &it.name, Tokens::ui(10.0), t.text);
+    let rate = seq.settings.frame_rate;
+    let frame_dur = rate.frame_duration().0.max(1);
+    let frames = (it.duration.0.max(1) + frame_dur - 1) / frame_dur;
+    let target_ticks = (lane.width() / 58.0).max(1.0) as i64;
+    let raw_step = (frames / target_ticks).max(1);
+    let magnitude = 10_i64.pow((raw_step as f64).log10().floor().max(0.0) as u32);
+    let step_frames = [1, 2, 5, 10].into_iter().map(|n| n * magnitude).find(|n| *n >= raw_step).unwrap_or(10 * magnitude);
+    let tick_y = lane.min.y + 16.0;
+    let painter = ui.painter().with_clip_rect(lane);
+    painter.line_segment([pos2(lane.min.x, tick_y), pos2(lane.max.x, tick_y)], Stroke::new(1.0, t.separator));
+    for f in (0..=frames).step_by(step_frames as usize) {
+        let x = lane.min.x + (f as f32 / frames.max(1) as f32) * lane.width();
+        painter.line_segment([pos2(x, tick_y - 5.0), pos2(x, tick_y + 2.0)], Stroke::new(1.0, t.tl_ruler_tick));
+        let tc = filmcraft_time::format_time(it.start + Tick(f * frame_dur), rate, seq.settings.drop_frame, filmcraft_time::TimeDisplay::Timecode, 48000);
+        painter.text(pos2(x + 2.0, lane.min.y + 1.0), Align2::LEFT_TOP, tc, Tokens::mono(9.0), t.tl_ruler_text);
+    }
+    let clip_bar = Rect::from_min_max(pos2(lane.min.x, lane.min.y + 19.0), pos2(lane.max.x, lane.min.y + 33.0));
+    ui.painter().rect_filled(clip_bar, 2.0, Color32::from_rgb(58, 58, 70));
+    ui.painter().text(pos2(lane.min.x + 4.0, clip_bar.center().y), Align2::LEFT_CENTER, &it.name, Tokens::ui(10.0), t.text);
     let scrub = Rect::from_min_max(lane.min, pos2(lane.max.x, lane.min.y + 18.0));
     let sresp = ui.interact(scrub, egui::Id::new(("ec-scrub", clip.0)), Sense::click_and_drag());
     app.auto.add("effectControls.lane", lane, "keyframe lane");
@@ -86,6 +104,9 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let key = format!("{}:{}", clip.0, idx);
             let open = !app.ui.collapsed_fx.contains(&key);
             let (r, resp) = bui.allocate_exact_size(vec2(body.width(), ROW_H), Sense::click());
+            bui.painter().rect_filled(r, 0.0, t.panel_bg);
+            bui.painter().line_segment([r.left_top(), r.right_top()], Stroke::new(1.0, t.separator));
+            bui.painter().line_segment([r.left_bottom(), r.right_bottom()], Stroke::new(1.0, t.separator));
             if resp.hovered() {
                 bui.painter().rect_filled(r, 0.0, t.hover);
             }
@@ -442,7 +463,7 @@ pub(crate) fn param_row(
                     }
                 }
                 ui.separator();
-                if ui.button("Clear").clicked() {
+                if ui.button("Delete Keyframe").clicked() {
                     actions
                         .push(("effects.deleteKeyframe".into(), with_mask(json!({"clip": clip.0, "effect": eff_json, "param": pd.id, "mediaTime": k.time.0}))));
                     ui.close();

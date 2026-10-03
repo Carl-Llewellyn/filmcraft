@@ -720,7 +720,7 @@ pub fn commands() -> Vec<CommandSpec> {
             "graphics.newText",
             "Text",
             &["Graphics and Titles", "New Layer"],
-            Some("Cmd+T"),
+            None,
             r#"{"text":str="New Text","position":[x,y]?,"clip":id?,"newClip":bool?,"vertical":bool=false,"size":px=100,"font":str?,"fontStyle":str?,"seconds":f64=5,"track":index?,"time":ticks?}"#,
             has_seq,
             |s, p| {

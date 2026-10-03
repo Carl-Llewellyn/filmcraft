@@ -10,6 +10,8 @@
 //! Layers that need converting before upload (linear f32 RGBA from CPU-rendered layers, 16-bit
 //! YUV such as ProRes) are converted to half floats by [`prepare`], which frame workers run off the
 //! UI thread; [`GpuCompositor::composite_prepared`] then only copies bytes into textures.
+//! The currently supported per-layer Brightness & Contrast effect runs in the fragment shader;
+//! unsupported effects arrive as CPU-rendered layers.
 //!
 //! The CPU plan executor (`filmcraft_render::plan::execute_cpu`) is the oracle; tests compare.
 
@@ -20,7 +22,7 @@ use rayon::prelude::*;
 
 use filmcraft_color::{Matrix, Range, Transfer};
 use filmcraft_frame::{Chroma, PixelData, VideoFrame};
-use filmcraft_render::plan::{FramePlan, PlanLayer};
+use filmcraft_render::plan::{FramePlan, PlanEffect, PlanLayer};
 
 pub mod lut;
 pub mod mask;
@@ -391,7 +393,7 @@ impl GpuCompositor {
         key
     }
 
-    fn uniforms(&self, l: &PlanLayer, key: (usize, u32, u32), out: (u32, u32)) -> [f32; 24] {
+    fn uniforms(&self, l: &PlanLayer, key: (usize, u32, u32), out: (u32, u32)) -> [f32; 28] {
         let up = &self.uploads[&key];
         let f = &l.frame;
         let m = &l.matrix;
@@ -414,6 +416,10 @@ impl GpuCompositor {
         let footprint = (1.0 / sx.min(sy).max(1e-6)) as f32;
         let taps = if footprint > 1.25 { footprint.ceil().min(4.0) } else { 1.0 };
         let _ = Matrix::Bt709;
+        let fx = match l.effect {
+            Some(PlanEffect::BrightnessContrast { brightness, contrast }) => [1.0, brightness, contrast, 0.0],
+            None => [0.0; 4],
+        };
         [
             m.a as f32,
             m.b as f32,
@@ -439,6 +445,10 @@ impl GpuCompositor {
             kb,
             up.code_scale,
             footprint.max(1.0),
+            fx[0],
+            fx[1],
+            fx[2],
+            fx[3],
         ]
     }
 
@@ -464,7 +474,7 @@ impl GpuCompositor {
                     },
                     None => VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px.clone()),
                 };
-                owned = [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0 }];
+                owned = [PlanLayer { frame: Arc::new(frame), matrix: filmcraft_geom::Affine::IDENTITY, opacity: 1.0, effect: None }];
                 (img.w as u32, img.h as u32, &owned[..])
             }
         };

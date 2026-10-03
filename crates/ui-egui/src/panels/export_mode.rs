@@ -41,6 +41,10 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         // settings
         let seq_name = app.session.project.item(seq_id).map(|i| i.name.clone()).unwrap_or_default();
         let fmt = filmcraft_engine::export::Format::from_name(&app.ui.export_format).unwrap_or(filmcraft_engine::export::Format::H264);
+        let hardware_available = filmcraft_engine::export::hardware_encoder_available();
+        if app.ui.export_video_encoder.is_empty() {
+            app.ui.export_video_encoder = if hardware_available { "hardware" } else { "software" }.into();
+        }
         if app.ui.export_path.is_empty() || !app.ui.export_path.ends_with(fmt.extension()) {
             app.ui.export_path = format!("~/Movies/{}.{}", seq_name.replace(' ', "_"), fmt.extension());
         }
@@ -62,6 +66,29 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         });
         sui.add_space(6.0);
+        if fmt == filmcraft_engine::export::Format::H264 {
+            sui.label(egui::RichText::new("Video encoder").color(t.text_dim));
+            let encoder_label = if app.ui.export_video_encoder == "hardware" { "Hardware (NVIDIA)" } else { "Software (CPU)" };
+            egui::ComboBox::from_id_salt("export-video-encoder").selected_text(encoder_label).width(sui.available_width()).show_ui(&mut sui, |ui| {
+                if ui
+                    .add_enabled(hardware_available, egui::Button::selectable(app.ui.export_video_encoder == "hardware", "Hardware (NVIDIA)"))
+                    .on_hover_text(if hardware_available { "Use NVIDIA NVENC for H.264 export" } else { "No NVIDIA NVENC device detected" })
+                    .clicked()
+                {
+                    app.ui.export_video_encoder = "hardware".into();
+                }
+                if ui.selectable_label(app.ui.export_video_encoder == "software", "Software (CPU)").clicked() {
+                    app.ui.export_video_encoder = "software".into();
+                }
+                if !hardware_available {
+                    ui.label(egui::RichText::new("NVIDIA NVENC not detected").weak().small());
+                }
+            });
+            if !hardware_available && app.ui.export_video_encoder == "hardware" {
+                sui.colored_label(t.danger, "NVENC is unavailable; choose Software.");
+            }
+            sui.add_space(6.0);
+        }
         let lines = [
             ("Video", format!("{}x{} · {} fps", q.settings.width, q.settings.height, q.settings.frame_rate.label())),
             ("Audio", format!("{} Hz · Stereo", q.settings.sample_rate)),
@@ -105,7 +132,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if resp.clicked() {
             let r = app.session.execute(
                 "file.exportMedia",
-                serde_json::json!({"path": expand_home(&app.ui.export_path), "format": app.ui.export_format, "burnCaptions": app.ui.export_burn_captions}),
+                serde_json::json!({"path": expand_home(&app.ui.export_path), "format": app.ui.export_format, "burnCaptions": app.ui.export_burn_captions, "videoEncoder": app.ui.export_video_encoder}),
             );
             if let Err(e) = r {
                 app.ui.status = e.to_string();

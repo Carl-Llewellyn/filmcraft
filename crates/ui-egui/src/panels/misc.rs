@@ -242,7 +242,7 @@ pub fn media_browser(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         });
         ui.data_mut(|d| d.insert_temp(dir_id, dir));
         if !import.is_empty() {
-            let r = app.session.execute("file.import", serde_json::json!({"paths": import}));
+            let r = app.session.execute("file.import", serde_json::json!({"paths": import, "background": !cfg!(target_arch = "wasm32")}));
             if let Err(e) = r {
                 app.ui.status = e.to_string();
             }

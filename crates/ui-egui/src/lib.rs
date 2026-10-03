@@ -644,7 +644,7 @@ impl FilmcraftApp {
                 if paths.is_empty() {
                     return Ok(Value::Null);
                 }
-                let r = self.session.execute("file.import", json!({"paths": paths})).map_err(|e| e.to_string());
+                let r = self.session.execute("file.import", json!({"paths": paths, "background": !cfg!(target_arch = "wasm32")})).map_err(|e| e.to_string());
                 if let Ok(v) = &r
                     && let Some(errs) = v.get("errors").and_then(Value::as_array)
                     && !errs.is_empty()
@@ -700,7 +700,7 @@ impl FilmcraftApp {
             }
         }
         if !paths.is_empty() {
-            let _ = self.session.execute("file.import", json!({"paths": paths}));
+            let _ = self.session.execute("file.import", json!({"paths": paths, "background": !cfg!(target_arch = "wasm32")}));
         }
     }
 
@@ -861,6 +861,16 @@ impl FilmcraftApp {
         self.auto.begin_frame();
         self.frames.set_context(&ctx);
         self.session.poll_persistence();
+        if let Some(status) = self
+            .session
+            .jobs
+            .iter()
+            .rev()
+            .find(|j| j.label == "Importing Media" && !j.progress.finished.load(std::sync::atomic::Ordering::Relaxed))
+            .map(|j| j.progress.status.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        {
+            self.ui.status = status;
+        }
         panels::trim_monitor::advance(self, &ctx);
         if self.session.persistence.is_some() && self.session.is_dirty() {
             // Keep polling the auto-save worker (status, "also save the project" results).
@@ -957,7 +967,13 @@ impl FilmcraftApp {
         let p = ui.painter();
         p.rect_filled(bar, 3.0, t.separator);
         p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())), 3.0, t.accent);
-        let verb = if job.label.starts_with("Rendering") { job.label.clone() } else { "Exporting".to_string() };
+        let verb = if job.label.starts_with("Rendering") {
+            job.label.clone()
+        } else if job.label == "Importing Media" {
+            "Importing".to_string()
+        } else {
+            "Exporting".to_string()
+        };
         p.text(egui::pos2(bar.min.x - 8.0, sb.center().y), egui::Align2::RIGHT_CENTER, format!("{verb}… {:.0}%", f * 100.0), Tokens::ui(11.0), t.text_dim);
         let resp = ui.interact(cancel, egui::Id::new(("job-cancel", job.id)), egui::Sense::click());
         let c = if resp.hovered() { t.hot_text } else { t.text_dim };

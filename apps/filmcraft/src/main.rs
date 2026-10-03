@@ -67,7 +67,7 @@ fn main() -> eframe::Result {
             _ => files.push(a),
         }
     }
-    let options = eframe::NativeOptions {
+    let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("FilmCraft")
             .with_inner_size([1600.0, 980.0])
@@ -84,6 +84,22 @@ fn main() -> eframe::Result {
         event_loop_builder: agent_event_loop(control_port.is_some()),
         ..Default::default()
     };
+    // The monitor and the custom wgpu compositor share eframe's device. Prefer the AMD
+    // adapter on Linux so both stay on the display GPU; NVENC creates its own NVIDIA context.
+    #[cfg(target_os = "linux")]
+    if let eframe::egui_wgpu::WgpuSetup::CreateNew(ref mut setup) = options.wgpu_options.wgpu_setup {
+        setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+            let compatible = |a: &&eframe::wgpu::Adapter| surface.is_none_or(|s| !s.get_capabilities(a).formats.is_empty());
+            adapters
+                .iter()
+                .filter(compatible)
+                .find(|a| a.get_info().vendor == 0x1002)
+                .cloned()
+                .or_else(|| adapters.iter().filter(compatible).find(|a| a.get_info().device_type == eframe::wgpu::DeviceType::DiscreteGpu).cloned())
+                .or_else(|| adapters.iter().find(compatible).cloned())
+                .ok_or_else(|| "no surface-compatible wgpu adapter".to_string())
+        }));
+    }
     eframe::run_native(
         "FilmCraft",
         options,

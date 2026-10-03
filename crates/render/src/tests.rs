@@ -208,6 +208,34 @@ fn plan_matches_reference_renderer() {
     }
 }
 
+#[test]
+fn gpu_plan_carries_only_supported_effects() {
+    let (mut p, _red, _ocean, seq, map) = setup();
+    let clip = place(&mut p, seq, 0, _red, 0, 48);
+    {
+        let (_, item) = p.sequence_mut(seq).unwrap().find_item_mut(clip).unwrap();
+        let mut effect = filmcraft_project::find_effect("brightness_contrast").unwrap().instance();
+        effect.param_mut("brightness").unwrap().value = ParamValue::Float(24.0);
+        effect.param_mut("contrast").unwrap().value = ParamValue::Float(-18.0);
+        item.effects.push(effect);
+    }
+    let plan = plan::plan_frame(&p, seq, Tick::ZERO, RenderOptions::default(), &map);
+    let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("supported effect should remain a GPU layer") };
+    assert!(matches!(layers[0].effect, Some(plan::PlanEffect::BrightnessContrast { brightness: 24.0, contrast: -18.0 })));
+    let actual = plan::execute_cpu(&plan);
+    let expected = render_sequence(&p, seq, Tick::ZERO, RenderOptions::default(), &map);
+    let max = actual.px.iter().zip(&expected.px).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    assert!(max < 1e-5, "CPU plan oracle differs from sequence renderer by {max}");
+
+    {
+        let (_, item) = p.sequence_mut(seq).unwrap().find_item_mut(clip).unwrap();
+        item.effects.push(filmcraft_project::find_effect("tint").unwrap().instance());
+    }
+    let plan = plan::plan_frame(&p, seq, Tick::ZERO, RenderOptions::default(), &map);
+    let plan::FramePlan::Layers { layers, .. } = plan else { panic!("unsupported effects should retain CPU layer fallback") };
+    assert!(layers.iter().all(|layer| layer.effect.is_none()));
+}
+
 /// A project with a 4 s bars-and-tone clip (1 kHz at −20 dBFS) on A1, with extra audio effects.
 fn tone_with(effects: &[(&str, &[(&str, f64)])]) -> (Project, ItemId, SourceMap) {
     let mut p = Project::new("fx");

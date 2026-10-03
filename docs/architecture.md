@@ -196,7 +196,7 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
           │
           └─ render::plan::plan_frame → gpu::GpuCompositor     GPU path
                layers = decoded YUV/RGBA frames + matrix + opacity;
-               anything the shaders don't cover is pre-rendered on the CPU
+               Brightness & Contrast runs in WGSL; other unsupported work is pre-rendered on CPU
           ▼
         ui-egui frames.rs worker pool ──► monitors (program/source), thumbnails, prefetch
 ```
@@ -218,10 +218,12 @@ file ──► codecs (MP4/MOV, MKV, audio)        demux + decode, GOP-aware see
   frame of the same source. A request that finds the shared decoder busy decodes with a private
   decoder.
 - **Compositor.** `render` is the reference for monitors, thumbnails and export. `render::plan`
-  turns a frame into GPU layers. Non-Normal blend modes, standard effects, adjustment layers, nested
-  sequences and non-dissolve transitions are rendered on the CPU for that layer or frame and handed to
-  the GPU as an image, so both paths give the same picture. Setting `FILMCRAFT_CPU_COMPOSITE=1`
-  forces the CPU path in the desktop app.
+  turns a frame into GPU layers. Brightness & Contrast currently runs in WGSL and is checked against
+  the CPU effect implementation. Other standard effects, Non-Normal blend modes, adjustment layers,
+  nested sequences and non-dissolve transitions are rendered on the CPU for that layer or frame and
+  handed to the GPU as an image. On Linux, the desktop app prefers the AMD wgpu adapter when it is
+  surface-compatible; video decoding still uses the software codec path. Setting
+  `FILMCRAFT_CPU_COMPOSITE=1` forces the CPU compositor in the desktop app.
 - **Frame scheduling.** `crates/ui-egui/src/frames.rs` runs a small pool of worker threads with
   prioritised jobs: the frame on screen first, then playback prefetch, then thumbnails. The UI never
   decodes. It shows the exact frame when it is ready and holds the nearest cached frame meanwhile.

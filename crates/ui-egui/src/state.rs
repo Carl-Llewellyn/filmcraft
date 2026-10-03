@@ -371,6 +371,9 @@ pub struct UiState {
     /// Export mode: burn visible caption tracks into the video.
     #[serde(default)]
     pub export_burn_captions: bool,
+    /// Export mode: selected H.264 backend (`hardware` or `software`; empty = detect default).
+    #[serde(default)]
+    pub export_video_encoder: String,
     /// Text panel: active tab ("Transcript" / "Captions" / "Graphics").
     #[serde(default = "captions_tab")]
     pub text_tab: String,
@@ -702,6 +705,7 @@ impl Default for UiState {
             export_format: "h264".into(),
             export_path: String::new(),
             export_burn_captions: false,
+            export_video_encoder: String::new(),
             text_tab: captions_tab(),
             caption_search: String::new(),
             transcript_sel: None,

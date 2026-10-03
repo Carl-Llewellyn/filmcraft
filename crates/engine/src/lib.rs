@@ -244,6 +244,8 @@ pub struct Session {
     pub journal: Vec<(String, Value)>,
     /// Background jobs (exports, render previews…).
     pub jobs: Vec<Job>,
+    /// Media-linking work started while importing an interchange document.
+    pub import_jobs: Vec<interchange::PendingImport>,
     /// User preferences (`prefs.*` commands) and where they persist (None = not persisted).
     pub prefs: autosave::Preferences,
     pub prefs_path: Option<std::path::PathBuf>,
@@ -342,6 +344,7 @@ impl Session {
             events: Vec::new(),
             journal: Vec::new(),
             jobs: Vec::new(),
+            import_jobs: Vec::new(),
             prefs: Default::default(),
             prefs_path: None,
             persistence: None,
@@ -439,6 +442,7 @@ impl Session {
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
         proxies::poll(self);
+        interchange::poll_imports(self);
         masks::poll(self);
         scene_detect::poll(self);
         let Some(p) = self.persistence.as_mut() else { return };
@@ -746,6 +750,8 @@ mod autosave_tests;
 mod clip_ops_tests;
 #[cfg(test)]
 mod color_tests;
+#[cfg(test)]
+mod encoding_benchmark_tests;
 #[cfg(test)]
 mod essential_sound_tests;
 #[cfg(test)]

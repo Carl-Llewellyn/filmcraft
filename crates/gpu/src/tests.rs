@@ -44,8 +44,13 @@ fn gpu_matches_cpu_plan() {
         width: w,
         height: h,
         layers: vec![
-            PlanLayer { frame: yuv_frame(640, 360), matrix: Affine::scale(0.5, 0.5), opacity: 1.0 },
-            PlanLayer { frame: rgba, matrix: Affine::motion(Vec2::new(200.0, 100.0), Vec2::new(0.4, 0.4), 12.0, Vec2::new(160.0, 90.0)), opacity: 0.7 },
+            PlanLayer { frame: yuv_frame(640, 360), matrix: Affine::scale(0.5, 0.5), opacity: 1.0, effect: None },
+            PlanLayer {
+                frame: rgba,
+                matrix: Affine::motion(Vec2::new(200.0, 100.0), Vec2::new(0.4, 0.4), 12.0, Vec2::new(160.0, 90.0)),
+                opacity: 0.7,
+                effect: None,
+            },
         ],
     };
     let cpu = execute_cpu(&plan).over_black_rgba8();
@@ -63,6 +68,38 @@ fn gpu_matches_cpu_plan() {
     let before = c.uploaded_bytes;
     c.composite(&plan);
     assert_eq!(c.uploaded_bytes, before);
+}
+
+#[test]
+fn gpu_brightness_contrast_matches_cpu_effect() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let (w, h) = (48u32, 32u32);
+    let pixels: Vec<f32> = (0..w * h)
+        .flat_map(|i| {
+            let x = (i % w) as f32 / (w - 1) as f32;
+            let y = (i / w) as f32 / (h - 1) as f32;
+            [x * 0.8, y * 0.7, (1.0 - x) * 0.6, 0.25 + (i % 4) as f32 * 0.25]
+        })
+        .collect();
+    let plan = FramePlan::Layers {
+        width: w as usize,
+        height: h as usize,
+        layers: vec![PlanLayer {
+            frame: Arc::new(VideoFrame::rgba_f32(w, h, pixels)),
+            matrix: Affine::IDENTITY,
+            opacity: 1.0,
+            effect: Some(filmcraft_render::plan::PlanEffect::BrightnessContrast { brightness: 22.0, contrast: 38.0 }),
+        }],
+    };
+    let cpu = execute_cpu(&plan).over_black_rgba8();
+    let mut compositor = GpuCompositor::new(&dev, &q);
+    compositor.composite(&plan);
+    let (_, _, gpu) = compositor.read_output().expect("readback");
+    let max = cpu.as_chunks::<4>().0.iter().zip(gpu.as_chunks::<4>().0).flat_map(|(a, b)| (0..3).map(move |c| a[c].abs_diff(b[c]))).max().unwrap_or(0);
+    assert!(max <= 2, "brightness/contrast GPU output differs by up to {max} code values");
 }
 
 #[test]
@@ -108,8 +145,8 @@ fn prepared_upload_matches_inline_conversion() {
         width: w as usize,
         height: h as usize,
         layers: vec![
-            PlanLayer { frame: yuv16, matrix: Affine::IDENTITY, opacity: 1.0 },
-            PlanLayer { frame: rgbaf, matrix: Affine::scale(0.5, 0.5), opacity: 0.8 },
+            PlanLayer { frame: yuv16, matrix: Affine::IDENTITY, opacity: 1.0, effect: None },
+            PlanLayer { frame: rgbaf, matrix: Affine::scale(0.5, 0.5), opacity: 0.8, effect: None },
         ],
     };
     let image = FramePlan::Image(filmcraft_render::Image { w: w as usize, h: h as usize, px: f32_layer });
@@ -138,7 +175,7 @@ fn upload_cache_keeps_buffers_alive() {
     let mut c = GpuCompositor::new(&dev, &q);
     let px = Arc::new(vec![200u8; 16 * 8 * 4]);
     let frame = Arc::new(VideoFrame { width: 16, height: 8, data: PixelData::Rgba8(px.clone()), ..(*yuv_frame(16, 8)).clone() });
-    let plan = FramePlan::Layers { width: 16, height: 8, layers: vec![PlanLayer { frame, matrix: Affine::IDENTITY, opacity: 1.0 }] };
+    let plan = FramePlan::Layers { width: 16, height: 8, layers: vec![PlanLayer { frame, matrix: Affine::IDENTITY, opacity: 1.0, effect: None }] };
     c.composite(&plan);
     drop(plan);
     assert!(Arc::strong_count(&px) > 1, "cached upload must own its pixel buffer");

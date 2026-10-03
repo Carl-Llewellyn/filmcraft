@@ -20,7 +20,7 @@ use rayon::prelude::*;
 
 use crate::{
     AudioEncoder, ColorSignal, EncodedPacket, EncoderFrame, ExportError, ExportSettings, Format, Out, Progress, Report, Result, VideoEncoder, audio_factories,
-    export_range, video_factories,
+    export_range,
 };
 
 /// What one [`Exporter::step`] did.
@@ -139,12 +139,10 @@ impl Exporter {
         }
         let opts = RenderOptions { scale: w as f32 / q.settings.width as f32, captions: settings.burn_captions, working_output: hdr_out, ..Default::default() };
         let sr = q.settings.sample_rate;
-        let venc = video_factories()
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find_map(|fac| fac(settings.format, w, h, rate, &settings))
-            .ok_or_else(|| ExportError::Unsupported(format!("{} encoder not available yet", settings.format.label())))??;
+        let venc = crate::create_video_encoder(settings.format, w, h, rate, &settings)?;
+        if !settings.part_of_batch {
+            progress.set_status(format!("Exporting {} frames ({}, {})", nframes, settings.format.label(), venc.name()));
+        }
         let brand = if settings.format == Format::H264 { Brand::Mp4 } else { Brand::Mov };
         // audio: AAC for MP4 when available, PCM otherwise (MOV)
         let aenc: Option<Box<dyn AudioEncoder>> = if settings.include_audio && brand == Brand::Mp4 {

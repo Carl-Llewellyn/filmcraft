@@ -11,6 +11,7 @@ struct U {
     p0: vec4<f32>,   // opacity, kind (0 rgba8 srgb straight, 1 rgba16f premul linear, 2 yuv), taps, transfer (0 srgb, 1 linear, 2 pq, 3 hlg)
     p1: vec4<f32>,   // y_off y_scale c_off c_scale (code units)
     p2: vec4<f32>,   // kr kb code_scale footprint
+    fx: vec4<f32>,   // effect id, brightness, contrast, reserved
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -74,6 +75,24 @@ fn to_linear(v: vec3<f32>) -> vec3<f32> {
     return srgb_to_linear(clamp(v, vec3(0.0), vec3(1.0)));
 }
 
+fn linear_to_srgb(v: vec3<f32>) -> vec3<f32> {
+    let x = max(v, vec3(0.0));
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, x <= vec3(0.0031308));
+}
+
+fn apply_effect(c: vec4<f32>) -> vec4<f32> {
+    if u.fx.x < 0.5 || c.a <= 1e-6 {
+        return c;
+    }
+    let encoded = linear_to_srgb(c.rgb / c.a);
+    let br = u.fx.y / 100.0 * 0.4;
+    let co = 1.0 + u.fx.z / 100.0;
+    let corrected = clamp((encoded - vec3(0.5)) * co + vec3(0.5 + br), vec3(0.0), vec3(1.0));
+    return vec4(srgb_to_linear(corrected) * c.a, c.a);
+}
+
 // One linear premultiplied sample at source position p.
 fn sample(p: vec2<f32>) -> vec4<f32> {
     let kind = u32(u.p0.y);
@@ -108,7 +127,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
     for (var j = 0u; j < n; j++) {
         for (var i = 0u; i < n; i++) {
             let off = (vec2(f32(i), f32(j)) + 0.5) / f32(n) - 0.5;
-            acc += sample(in.sp + off * fp);
+            acc += apply_effect(sample(in.sp + off * fp));
         }
     }
     return acc / f32(n * n) * u.p0.x;

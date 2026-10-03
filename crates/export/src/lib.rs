@@ -11,6 +11,8 @@ use std::io::Write;
 
 mod job;
 pub use job::{Exporter, Step, stepped};
+#[cfg(target_os = "linux")]
+mod nvenc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -52,6 +54,16 @@ pub enum Format {
     Wav,
 }
 
+/// Preferred H.264 encoder backend. `Auto` uses hardware when available and otherwise software.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoEncoderPreference {
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+
 impl Format {
     pub fn from_name(s: &str) -> Option<Format> {
         Some(match s.to_ascii_lowercase().replace([' ', '-', '_', '.'], "").as_str() {
@@ -91,6 +103,9 @@ impl Format {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExportSettings {
     pub format: Format,
+    /// H.264 backend selection; ignored by formats with a dedicated encoder.
+    #[serde(default)]
+    pub video_encoder: VideoEncoderPreference,
     pub path: String,
     /// Timeline range (default: In/Out if set, else the whole sequence).
     pub range: Option<TimeRange>,
@@ -249,6 +264,7 @@ impl Default for ExportSettings {
     fn default() -> Self {
         Self {
             format: Format::H264,
+            video_encoder: VideoEncoderPreference::Auto,
             path: String::new(),
             range: None,
             scale: 1.0,
@@ -263,6 +279,18 @@ impl Default for ExportSettings {
             signal: ColorSignal::default(),
             sink: None,
         }
+    }
+}
+
+/// Whether an NVIDIA NVENC H.264 device is currently discoverable on this machine.
+pub fn hardware_encoder_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        nvenc::available()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -322,6 +350,10 @@ pub trait VideoEncoder: Send {
     fn timescale(&self) -> u32;
     fn encode(&mut self, frame: &EncoderFrame) -> Result<Vec<EncodedPacket>>;
     fn flush(&mut self) -> Result<Vec<EncodedPacket>>;
+    /// Human-readable backend label for export progress and diagnostics.
+    fn name(&self) -> &'static str {
+        "Video encoder"
+    }
     /// Media start offset for an edit list (B-frame delay), in the encoder timescale.
     fn media_start(&self) -> Option<i64> {
         None
@@ -344,7 +376,16 @@ pub type AudioEncoderFactory = fn(format: Format, sample_rate: u32, channels: u3
 
 fn video_factories() -> &'static RwLock<Vec<EncoderFactory>> {
     static F: OnceLock<RwLock<Vec<EncoderFactory>>> = OnceLock::new();
-    F.get_or_init(|| RwLock::new(vec![h264_factory, prores_factory, dnx_factory, mjpeg_factory]))
+    F.get_or_init(|| {
+        let factories: Vec<EncoderFactory> = vec![h264_factory, prores_factory, dnx_factory, mjpeg_factory];
+        #[cfg(target_os = "linux")]
+        let factories = {
+            let mut factories = factories;
+            factories.insert(0, nvenc::factory);
+            factories
+        };
+        RwLock::new(factories)
+    })
 }
 fn audio_factories() -> &'static RwLock<Vec<AudioEncoderFactory>> {
     static F: OnceLock<RwLock<Vec<AudioEncoderFactory>>> = OnceLock::new();
@@ -354,6 +395,17 @@ fn audio_factories() -> &'static RwLock<Vec<AudioEncoderFactory>> {
 pub fn register_encoder(f: EncoderFactory) {
     video_factories().write().unwrap_or_else(|e| e.into_inner()).insert(0, f);
 }
+
+/// Create the first available encoder for a format using the registered backend preferences.
+pub fn create_video_encoder(format: Format, width: u32, height: u32, rate: FrameRate, settings: &ExportSettings) -> Result<Box<dyn VideoEncoder>> {
+    video_factories()
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find_map(|factory| factory(format, width, height, rate, settings))
+        .ok_or_else(|| ExportError::Unsupported(format!("{} encoder not available yet", format.label())))?
+}
+
 pub fn register_audio_encoder(f: AudioEncoderFactory) {
     audio_factories().write().unwrap_or_else(|e| e.into_inner()).insert(0, f);
 }
@@ -632,6 +684,9 @@ impl VideoEncoder for H264Encoder {
     fn timescale(&self) -> u32 {
         self.rate.num as u32
     }
+    fn name(&self) -> &'static str {
+        "Software H.264"
+    }
     fn encode(&mut self, f: &EncoderFrame) -> Result<Vec<EncodedPacket>> {
         match f.hdr {
             Some(rgb) => {
@@ -719,7 +774,7 @@ pub fn rgbf_to_yuv420_8(rgb: &[f32], w: usize, h: usize, kr: f32, kb: f32, y: &m
 }
 
 fn h264_factory(format: Format, w: u32, h: u32, rate: FrameRate, s: &ExportSettings) -> Option<Result<Box<dyn VideoEncoder>>> {
-    if format != Format::H264 {
+    if format != Format::H264 || s.video_encoder == VideoEncoderPreference::Hardware {
         return None;
     }
     let mut cfg = filmcraft_h264enc::EncoderConfig::new(w, h, rate.num as u32, rate.den as u32);

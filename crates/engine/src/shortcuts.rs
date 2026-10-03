@@ -570,7 +570,9 @@ impl Shortcuts {
                 continue;
             }
             let b = Binding::new(c, k, panel_opt(p));
-            let taken = base.iter().chain(added.iter()).any(|o| o.context() == b.context() && o.chord() == b.chord());
+            let platform = Platform::current();
+            let effective = b.chord().expect("preset keys are valid").effective(platform);
+            let taken = base.iter().chain(added.iter()).any(|o| o.context() == b.context() && o.chord().is_some_and(|c| c.effective(platform) == effective));
             if !taken {
                 added.push(b);
             }

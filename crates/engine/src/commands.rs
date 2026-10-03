@@ -593,7 +593,7 @@ fn build() -> Vec<CommandSpec> {
                 Ok(json!({"items": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
             }
         ),
-        cmd!("file.import", "Import…", ["File"], Some("Cmd+I"), r#"{"paths":[str],"bin":binId?}"#, always, |s, p| {
+        cmd!("file.import", "Import…", ["File"], Some("Cmd+I"), r#"{"paths":[str],"bin":binId?,"background":bool?}"#, always, |s, p| {
             let bin = u64_p(p, "bin").map(filmcraft_project::BinId);
             let paths: Vec<String> = match p.get("paths").and_then(Value::as_array) {
                 Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -624,7 +624,12 @@ fn build() -> Vec<CommandSpec> {
                     }
                     Ok(b) if crate::interchange::detect(&path, &b).is_some() => {
                         let fmt = crate::interchange::detect(&path, &b).expect("detected");
-                        match crate::interchange::import(s, &path, &b, fmt) {
+                        let imported = if bool_p(p, "background").unwrap_or(false) {
+                            crate::interchange::import_background(s, &path, &b, fmt)
+                        } else {
+                            crate::interchange::import(s, &path, &b, fmt)
+                        };
+                        match imported {
                             Ok(r) => {
                                 sequences.extend(r["sequences"].as_array().cloned().unwrap_or_default());
                                 reports.push(r);
@@ -807,7 +812,7 @@ fn build() -> Vec<CommandSpec> {
             "Media…",
             ["File", "Export"],
             None,
-            r#"{"path":str,"format":"h264|prores|dnxhr|mjpeg|png|gif|wav","scale":f32=1,"audio":bool=true,"quality":0..100,"burnCaptions":bool=false,"proresProfile":"proxy|lt|standard|hq"?,"dnxProfile":"lb|sq|hq|hqx"?}"#,
+            r#"{"path":str,"format":"h264|prores|dnxhr|mjpeg|png|gif|wav","scale":f32=1,"audio":bool=true,"quality":0..100,"burnCaptions":bool=false,"videoEncoder":"hardware|software|auto"?,"proresProfile":"proxy|lt|standard|hq"?,"dnxProfile":"lb|sq|hq|hqx"?}"#,
             has_seq,
             |s, p| export_media(s, p)
         ),
@@ -1326,7 +1331,7 @@ fn build() -> Vec<CommandSpec> {
             }
             Ok(Value::Null)
         }),
-        cmd!("markers.goPrev", "Go to Previous Marker", ["Markers"], Some("Cmd+Shift+M"), "{}", has_seq, |s, _| {
+        cmd!("markers.goPrev", "Go to Previous Marker", ["Markers"], None, "{}", has_seq, |s, _| {
             let t = s.playhead();
             if let Some(m) = s.active_sequence().and_then(|q| q.markers.iter().rev().map(|m| m.start).find(|m| *m < t)) {
                 s.set_playhead(m);
@@ -2107,8 +2112,15 @@ fn export_media(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other(format!("{} export is not available (no encoder registered)", format.label())));
     }
     let path = str_p(p, "path").map(str::to_string).ok_or_else(|| bad("file.exportMedia", "need `path`"))?;
+    let video_encoder = match str_p(p, "videoEncoder").unwrap_or("auto") {
+        "hardware" => filmcraft_export::VideoEncoderPreference::Hardware,
+        "software" => filmcraft_export::VideoEncoderPreference::Software,
+        "auto" => filmcraft_export::VideoEncoderPreference::Auto,
+        _ => return Err(bad("file.exportMedia", "videoEncoder must be hardware, software, or auto")),
+    };
     let settings = filmcraft_export::ExportSettings {
         format,
+        video_encoder,
         path: path.clone(),
         range: None,
         scale: f64_p(p, "scale").unwrap_or(1.0) as f32,
